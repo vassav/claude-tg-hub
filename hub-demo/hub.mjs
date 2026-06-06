@@ -41,6 +41,7 @@ const GRACE_MS = 8000;                       // after startup, let survivors rec
 const JANITOR_MS = 30000;                     // periodic reconcile/cleanup
 const DEAD_TTL_MS = 7 * 24 * 3600 * 1000;     // forget resumable entries older than a week
 const STARTING_TTL_MS = 60000;                // discard a 'starting' entry that never registered & wrote nothing
+const ACTIVE_WINDOW_MS = 45000;               // a .jsonl touched within this is treated as a live conversation
 if (!TOKEN) { console.error('HUB_BOT_TOKEN missing in .env'); process.exit(1); }
 if (!OWNER) { console.error('HUB_OWNER_ID missing in .env'); process.exit(1); }
 
@@ -65,18 +66,40 @@ const idToDir = new Map();     // session id -> projects dir
 // ── durable registry (survives hub restart/crash) ────────────────────────────
 // id (== conversation UUID for hub-managed sessions) -> entry. Only MANAGED
 // sessions are persisted; non-managed (launcher/plugin) live in `sessions` only.
-// status: starting → live → detached (process maybe alive) → dead (process gone, resumable)
-const registry = new Map();    // id -> { id, cwd, label, status, managed, resumeUuid, pid, createdAt, lastSeen }
+// status: starting → live → detached (maybe alive) → dead (gone, resumable)
+const registry = new Map();    // id -> { id, cwd, label, status, managed, resumeUuid, pid, bootId, createdAt, lastSeen }
+const BOOT_ID = randomUUID();  // identifies THIS hub run; a pid is trusted as "alive" only if seen this boot
 
 // PID liveness — the load-bearing guard against double-spawning one conversation.
 function isAlive(pid) {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } // EPERM = exists; ESRCH = gone
 }
-// Does claude's conversation file (<id>.jsonl) still exist on disk?
-function conversationExists(id) {
-  try { for (const d of readdirSync(PROJECTS_DIR)) if (existsSync(join(PROJECTS_DIR, d, id + '.jsonl'))) return true; } catch {}
+// Trust a recorded pid only if we observed it live during THIS hub run — a bare pid
+// from a previous boot may have been reused by an unrelated process (false "alive").
+function isOwnLive(e) { return !!e && e.bootId === BOOT_ID && isAlive(e.pid); }
+// Path to claude's conversation file (<id>.jsonl) on disk, or null.
+function conversationFile(id) {
+  try { for (const d of readdirSync(PROJECTS_DIR)) { const f = join(PROJECTS_DIR, d, id + '.jsonl'); if (existsSync(f)) return f; } } catch {}
+  return null;
+}
+function conversationExists(id) { return !!conversationFile(id); }
+// A conversation whose .jsonl was just written is almost certainly live — don't resume it.
+function jsonlFresh(id) { const f = conversationFile(id); if (!f) return false; try { return Date.now() - statSync(f).mtimeMs < ACTIVE_WINDOW_MS; } catch { return false; } }
+// A live NON-managed session in the same cwd may BE this conversation (we don't know
+// its real UUID) — refuse to resume into it to avoid a co-writer on one .jsonl.
+function liveCwdConflict(id, cwd) {
+  if (!cwd) return false;
+  for (const lid of sessions.keys()) { if (lid === id) continue; if (!registry.get(lid)?.managed && sessions.get(lid)?.cwd === cwd) return true; }
   return false;
+}
+// Decide a non-live managed entry's fate. NEVER mark dead while it looks alive (own
+// process alive, or its .jsonl actively written) — that would let a resume double-write
+// one conversation. Process gone + history present → dead (resumable); nothing → discard.
+function resolveFate(e, id) {
+  if (isOwnLive(e) || jsonlFresh(id)) { e.status = 'detached'; e.lastSeen = Date.now(); }
+  else if (conversationExists(id)) { e.status = 'dead'; e.lastSeen = Date.now(); }
+  else registry.delete(id);
 }
 function saveRegistry() {
   try {
@@ -144,25 +167,32 @@ function startSession(cwd, { resumeUuid } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
   if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return false; }
-  if (isAlive(e0?.pid)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return false; }
-  if (resumeUuid && !conversationExists(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — its history is gone`); registry.delete(id); saveRegistry(); return false; }
+  if (isOwnLive(e0)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return false; }
+  if (resumeUuid) {
+    if (!conversationExists(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — its history is gone`); registry.delete(id); saveRegistry(); return false; }
+    if (jsonlFresh(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return false; }
+    if (liveCwdConflict(id, cwd)) { notify(`can't resume ${id.slice(0, 8)} — another live session is in ${cwd}`); return false; }
+  }
   pendingActivate.add(id);
-  upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: null, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now() });
+  let child;
   try {
-    spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN });
-    // Watchdog: if it never registers, surface the failure instead of leaving a ghost.
-    setTimeout(() => {
-      if (!pendingActivate.has(id) || sessions.has(id)) return;
-      pendingActivate.delete(id);
-      const e = registry.get(id);
-      if (e) { if (conversationExists(id)) { e.status = 'dead'; } else registry.delete(id); saveRegistry(); }
-      notify(`⚠️ ${labelOf(id)} didn't come up.${conversationExists(id) ? ' It stays resumable.' : ''}`);
-    }, STARTING_TTL_MS);
-    notify(resumeUuid
-      ? `▶ resuming ${id.slice(0, 8)}… in ${cwd}\nit'll reconnect and become active.`
-      : `➕ new session in ${cwd}\nit'll appear and become active shortly.`);
-    return true;
+    child = spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN });
   } catch (e) { pendingActivate.delete(id); registry.delete(id); saveRegistry(); notify(`start failed: ${e?.message}`); return false; }
+  // Record the REAL claude pid now (from the pty child), independent of the shim
+  // registering — so the liveness guard holds during the spawn→register window.
+  upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: child?.pid ?? null, bootId: BOOT_ID, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now() });
+  // Watchdog: if it never registers, resolve its fate by liveness (alive → keep; gone → dead/discard).
+  setTimeout(() => {
+    if (!pendingActivate.has(id) || sessions.has(id)) return;
+    pendingActivate.delete(id);
+    const e = registry.get(id);
+    if (e) { resolveFate(e, id); saveRegistry(); }
+    notify(`⚠️ ${labelOf(id)} didn't come up.${registry.get(id)?.status === 'dead' ? ' It stays resumable.' : ''}`);
+  }, STARTING_TTL_MS);
+  notify(resumeUuid
+    ? `▶ resuming ${id.slice(0, 8)}… in ${cwd}\nit'll reconnect and become active.`
+    : `➕ new session in ${cwd}\nit'll appear and become active shortly.`);
+  return true;
 }
 
 // Periodic reconcile: resolve detached→dead/discard via PID, drop phantoms, TTL-prune.
@@ -171,13 +201,9 @@ function janitor() {
   for (const e of [...registry.values()]) {
     if (sessions.has(e.id)) continue;                                   // live — leave alone
     if (!e.managed) { registry.delete(e.id); changed = true; continue; } // never persist non-managed
-    if (e.status === 'detached' && !isAlive(e.pid)) {                   // process confirmed gone
-      if (conversationExists(e.id)) { e.status = 'dead'; e.lastSeen = e.lastSeen || now; }
-      else { registry.delete(e.id); }
-      changed = true; continue;
-    }
-    if (e.status === 'starting' && !pendingActivate.has(e.id) && now - (e.lastSeen || e.createdAt || 0) > STARTING_TTL_MS && !conversationExists(e.id)) {
-      registry.delete(e.id); changed = true; continue;                   // phantom that never wrote anything
+    if (e.status === 'detached') { resolveFate(e, e.id); changed = true; continue; } // alive→keep; gone→dead/discard
+    if (e.status === 'starting' && !pendingActivate.has(e.id) && now - (e.lastSeen || e.createdAt || 0) > STARTING_TTL_MS) {
+      resolveFate(e, e.id); changed = true; continue;                    // never came up — resolve by liveness
     }
     if (e.status === 'dead' && now - (e.lastSeen || 0) > DEAD_TTL_MS) { registry.delete(e.id); changed = true; } // TTL
   }
@@ -277,7 +303,8 @@ net.createServer(sock => {
         if (managed) {
           upsertRegistry(sid, {
             cwd: m.cwd, label, status: 'live', lastSeen: Date.now(), managed: true,
-            resumeUuid: known?.resumeUuid ?? sid, createdAt: known?.createdAt ?? Date.now(), pid: m.ppid || null,
+            resumeUuid: known?.resumeUuid ?? sid, createdAt: known?.createdAt ?? Date.now(),
+            pid: m.ppid || known?.pid || null, bootId: BOOT_ID,
           });
         }
         if (pendingActivate.has(sid)) { active = sid; pendingActivate.delete(sid); }
@@ -307,12 +334,7 @@ net.createServer(sock => {
     // Decide the durable fate by whether the claude process is actually gone.
     const e = registry.get(sid);
     let resumable = false;
-    if (e?.managed) {
-      if (isAlive(e.pid)) { e.status = 'detached'; e.lastSeen = Date.now(); } // transient drop — expect reconnect
-      else if (conversationExists(sid)) { e.status = 'dead'; e.lastSeen = Date.now(); resumable = true; } // gone
-      else registry.delete(sid);                                              // phantom — discard
-      saveRegistry();
-    }
+    if (e?.managed) { resolveFate(e, sid); resumable = e.status === 'dead'; saveRegistry(); }
     notify(`⚠️ ${label} disconnected${resumable ? ' — resume via /sessions' : ''}`, { reply_markup: replyKeyboard() });
   });
   sock.on('error', () => {});
