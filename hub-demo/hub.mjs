@@ -267,7 +267,14 @@ function readMeta(file) {
       if (!title && o.type === 'user' && o.message) {
         const c = o.message.content;
         const parts = typeof c === 'string' ? [c] : Array.isArray(c) ? c.map(x => typeof x === 'string' ? x : (x?.type === 'text' ? x.text : '')) : [];
-        for (const part of parts) { const t = (part || '').trim(); if (t && !t.startsWith('<')) { title = t.replace(/\s+/g, ' ').slice(0, 50); break; } }
+        for (const part of parts) {
+          let t = (part || '').trim();
+          if (!t) continue;
+          if (/^<channel\b/i.test(t)) { const mm = /<channel[^>]*>([\s\S]*?)<\/channel>/i.exec(t); t = (mm ? mm[1] : '').trim(); } // unwrap a channel message
+          else if (t.startsWith('<')) continue; // skip other wrapper blocks (system reminders, etc.)
+          if (!t) continue;
+          title = t.replace(/\s+/g, ' ').slice(0, 50); break;
+        }
       }
       if (cwd && title) break;
     }
@@ -298,6 +305,18 @@ function listProjects() {
   }
   byDir.sort((a, b) => b.latest - a.latest);
   return byDir;
+}
+const PROJECTS_PROMPT = '📁 Projects (recent). Pick one to see its sessions:';
+// Build the top-level projects-list keyboard (refreshes the on-disk snapshot).
+function projectsKeyboard() {
+  lastProjects = listProjects();
+  const kb = new InlineKeyboard();
+  lastProjects.slice(0, 10).forEach((p, i) => {
+    const cwd = readMeta(join(PROJECTS_DIR, p.dir, p.sessions[0].id + '.jsonl')).cwd || p.dir;
+    p.cwd = cwd;
+    kb.text(`${shortCwd(cwd)} (${p.sessions.length}) · ${ago(p.latest)}`, `proj:${i}`).row();
+  });
+  return kb;
 }
 
 // ── startup recovery ─────────────────────────────────────────────────────────
@@ -401,16 +420,9 @@ bot.command('sessions', async ctx => {
 
 bot.command('projects', async ctx => {
   if (!owns(ctx)) return;
-  lastProjects = listProjects();
+  const kb = projectsKeyboard();
   if (!lastProjects.length) { await ctx.reply('no past sessions found'); return; }
-  const top = lastProjects.slice(0, 10);
-  const kb = new InlineKeyboard();
-  top.forEach((p, i) => {
-    const cwd = readMeta(join(PROJECTS_DIR, p.dir, p.sessions[0].id + '.jsonl')).cwd || p.dir;
-    p.cwd = cwd;
-    kb.text(`${shortCwd(cwd)} (${p.sessions.length}) · ${ago(p.latest)}`, `proj:${i}`).row();
-  });
-  await ctx.reply('📁 Projects (recent). Pick one to see its sessions:', { reply_markup: kb });
+  await ctx.reply(PROJECTS_PROMPT, { reply_markup: kb });
 });
 
 bot.command('use', async ctx => {
@@ -483,10 +495,19 @@ bot.on('callback_query:data', async ctx => {
     const kb = new InlineKeyboard();
     kb.text('➕ New session here', `new:${m[1]}`).row();
     for (const s of p.sessions.slice(0, 8)) {
-      const meta = readMeta(join(PROJECTS_DIR, p.dir, s.id + '.jsonl'));
-      kb.text(`▶ ${meta.title || s.id.slice(0, 8)} · ${ago(s.mtime)}`, `res:${s.id}`).row();
+      const named = labelOf(s.id);                                   // our set_title / slug name, if we know it
+      const title = named !== s.id ? named : (readMeta(join(PROJECTS_DIR, p.dir, s.id + '.jsonl')).title || s.id.slice(0, 8));
+      kb.text(`▶ ${title} · ${ago(s.mtime)}`, `res:${s.id}`).row();
     }
+    kb.text('⬅️ Назад', 'back:projects').row();
     await ctx.editMessageText(`📁 ${p.cwd || p.dir}\nStart a new session, or resume one:`, { reply_markup: kb }).catch(() => {});
+    return;
+  }
+
+  if (data === 'back:projects') {
+    await ctx.answerCallbackQuery().catch(() => {});
+    const kb = projectsKeyboard();
+    await ctx.editMessageText(lastProjects.length ? PROJECTS_PROMPT : 'no past sessions found', { reply_markup: lastProjects.length ? kb : undefined }).catch(() => {});
     return;
   }
 
