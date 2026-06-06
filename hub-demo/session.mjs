@@ -8,12 +8,15 @@ import { join } from 'node:path';
 const CLAUDE = process.env.CLAUDE_BIN
   || 'C:\\Users\\vsavinov\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe';
 
-// id        — our hub-side label/key for the shim (SESSION_ID)
-// cwd       — working dir for the claude session
-// resumeId  — optional claude session_id to resume (--resume)
-// shimPath  — absolute path to shim.mjs
-// tmpDir    — scratch dir for per-session mcp.json + logs
-export function spawnSession({ id, cwd, resumeId, shimPath, tmpDir, hubPort, hubToken }) {
+// id          — our hub-side key for the shim (SESSION_ID); for managed sessions
+//               this equals the claude conversation UUID
+// cwd         — working dir for the claude session
+// resumeId    — optional claude session_id to resume (--resume)
+// sessionUuid — for NEW sessions, force claude's conversation id (--session-id)
+//               so the hub records it and can always resume the session later
+// shimPath    — absolute path to shim.mjs
+// tmpDir      — scratch dir for per-session mcp.json + logs
+export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir, hubPort, hubToken }) {
   mkdirSync(cwd, { recursive: true });
   mkdirSync(tmpDir, { recursive: true });
   const mcp = join(tmpDir, id + '.mcp.json');
@@ -26,6 +29,7 @@ export function spawnSession({ id, cwd, resumeId, shimPath, tmpDir, hubPort, hub
 
   const args = ['--mcp-config', mcp, '--strict-mcp-config', '--dangerously-load-development-channels', 'server:hub', '--allowedTools', 'mcp__hub__reply'];
   if (resumeId) args.push('--resume', resumeId);
+  else if (sessionUuid) args.push('--session-id', sessionUuid); // hub controls the conversation UUID → always resumable
 
   const childEnv = { ...process.env };
   delete childEnv.HUB_BOT_TOKEN; // sessions don't need the bot secret

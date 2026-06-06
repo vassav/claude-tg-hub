@@ -38,7 +38,7 @@ let hub = null, hubBuf = '', hubReady = false, queue = [];
 function connectHub() {
   hub = net.connect({ host: '127.0.0.1', port: HUB_PORT }, () => {
     hubReady = true;
-    hub.write(JSON.stringify({ t: 'register', sessionId: SESSION_ID, token: HUB_TOKEN, cwd: process.cwd() }) + '\n');
+    hub.write(JSON.stringify({ t: 'register', sessionId: SESSION_ID, token: HUB_TOKEN, cwd: process.cwd(), ppid: process.ppid }) + '\n');
     for (const m of queue) hub.write(JSON.stringify(m) + '\n');
     queue = [];
     log('hub connected');
