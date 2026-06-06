@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hub": {
+      "command": "node",
+      "args": ["D:\\Projects\\vassav\\claude-tg-hub\\spike\\channel-server\\channel-server.mjs"]
+    }
+  }
+}

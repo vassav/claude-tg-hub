@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hub": {
+      "command": "node",
+      "args": ["D:\\Projects\\vassav\\claude-tg-hub\\spike\\channel-server\\channel-server.mjs"],
+      "env": {
+        "CHANNEL_LOG": "D:\\Projects\\vassav\\claude-tg-hub\\sandbox\\channel.log",
+        "CHANNEL_INJECT": "D:\\Projects\\vassav\\claude-tg-hub\\sandbox\\inject.txt"
+      }
+    }
+  }
+}

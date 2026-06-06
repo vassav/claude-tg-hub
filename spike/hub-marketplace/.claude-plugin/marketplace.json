@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tg-hub-dev",
+  "description": "Local dev marketplace for claude-tg-hub channel spike",
+  "owner": { "name": "vassav" },
+  "plugins": [
+    {
+      "name": "hub",
+      "description": "claude-tg-hub channel spike server (custom channel MCP)",
+      "source": "./plugins/hub",
+      "category": "mcp"
+    }
+  ]
+}

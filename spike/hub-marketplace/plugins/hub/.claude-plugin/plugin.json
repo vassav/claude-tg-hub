@@ -1,0 +1,6 @@
+{
+  "name": "hub",
+  "description": "claude-tg-hub channel spike — custom channel MCP server (declares claude/channel + permission)",
+  "version": "0.0.1",
+  "keywords": ["channel", "mcp", "telegram"]
+}

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+# Build output
+dist/
+build/
+*.tsbuildinfo
+# Env / secrets
+.env
+.env.*
+!.env.example
+# Logs / runtime
+logs/
+*.log
+*.out
+inject.txt
+# Runtime/state
+.state/
+*.pid
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

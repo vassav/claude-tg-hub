@@ -1,0 +1,16 @@
+{
+  "name": "claude-tg-hub-demo",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Demo: one Telegram bot routing to N Claude CLI sessions via native channels.",
+  "scripts": {
+    "hub": "node hub.mjs",
+    "launch": "node launch.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "grammy": "^1.30.0",
+    "node-pty": "^1.0.0"
+  }
+}
