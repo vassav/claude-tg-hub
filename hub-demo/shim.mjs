@@ -75,7 +75,15 @@ function handle(msg) {
     toEngine({ jsonrpc: '2.0', id, result: {
       protocolVersion: params?.protocolVersion || '2025-06-18',
       capabilities: { experimental: { 'claude/channel': {}, 'claude/channel/permission': {} }, tools: {} },
-      serverInfo: { name: 'tg-hub-shim', version: '0.0.2' },
+      serverInfo: { name: 'tg-hub-shim', version: '0.0.3' },
+      instructions: [
+        'The user reaches you over Telegram and does NOT see this terminal. Their messages arrive as',
+        '<channel source="hub" chat_id="..." message_id="..." user="..." ts="...">…</channel> blocks.',
+        'To say ANYTHING to the user you MUST call the `reply` tool, passing chat_id from the inbound',
+        '<channel> block. Your normal/transcript output never reaches them.',
+        'Always send a `reply` when you finish a request (so their phone pings), and send brief interim',
+        'replies during long tasks. If you need input, ask via `reply` and wait for their next message.',
+      ].join(' '),
     }});
     return;
   }
