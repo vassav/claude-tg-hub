@@ -50,6 +50,15 @@ let lastProjects = [];         // [{ dir, cwd, sessions:[{id,mtime,title?}], lat
 const idToDir = new Map();     // session id -> projects dir
 
 const labelOf = id => sessions.get(id)?.label || id;
+// Informative, unique label derived from the project folder (cwd basename).
+function makeLabel(cwd) {
+  let base = (cwd || '').replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || 'session';
+  base = base.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 18) || 'session';
+  const used = new Set([...sessions.values()].map(s => s.label));
+  let label = base, i = 2;
+  while (used.has(label)) label = `${base}-${i++}`;
+  return label;
+}
 const notify = (text, extra) => bot.api.sendMessage(OWNER, text, extra).catch(() => {});
 function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.conn.write(JSON.stringify(obj) + '\n'); return true; } return false; }
 
@@ -147,7 +156,7 @@ net.createServer(sock => {
       if (m.t === 'register') {
         if (m.token !== IPC_TOKEN) { sock.end(); return; }
         sid = m.sessionId;
-        const label = 's' + (order.length + 1);
+        const label = makeLabel(m.cwd);
         sessions.set(sid, { conn: sock, cwd: m.cwd, label });
         order.push(sid);
         if (pendingActivate.has(sid)) { active = sid; pendingActivate.delete(sid); }
@@ -302,11 +311,14 @@ bot.on('message:text', async ctx => {
   const rid = ctx.message.reply_to_message?.message_id;
   if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), text); return; }
 
-  const sw = /^\s*(s\d+)\s*✓?\s*$/.exec(text);
-  if (sw) { const id = order.find(x => labelOf(x) === sw[1]); if (id) { active = id; await ctx.reply(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard() }); return; } }
+  // bare label tap from the keyboard (optional trailing ✓) -> switch active
+  const bare = text.replace(/\s*✓\s*$/, '').trim();
+  const swId = order.find(x => labelOf(x) === bare);
+  if (swId) { active = swId; await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard() }); return; }
 
-  const mm = /^\/(s\d+)\s+([\s\S]+)$/.exec(text);
-  if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); return; } }
+  // /to <label> <text> -> one-off send to a specific session without switching
+  const mm = /^\/to\s+(\S+)\s+([\s\S]+)$/.exec(text);
+  if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); } else { await ctx.reply(`no session "${mm[1]}" — see /sessions`); } return; }
 
   if (!active) { await ctx.reply('no active session — /projects to resume one, or start the launcher'); return; }
   await routeTo(ctx, active, text);
