@@ -120,6 +120,15 @@ function handle(msg) {
   }
   if (method && method.includes('permission_request')) {
     const p = params || {};
+    // Our own channel tools (reply / set_title, under the 'hub' MCP server) are
+    // internal plumbing — auto-allow them locally so they NEVER prompt the user,
+    // regardless of --allowedTools or the claude version. Real actions
+    // (Bash/Write/…) still go to Telegram for approval.
+    if (String(p.tool_name || '').startsWith('mcp__hub__')) {
+      toEngine({ jsonrpc: '2.0', method: 'notifications/claude/channel/permission', params: { request_id: p.request_id, behavior: 'allow' } });
+      log('auto-allowed own tool', p.tool_name);
+      return;
+    }
     sendHub({ t: 'permission_request', sessionId: SESSION_ID, request_id: p.request_id, tool_name: p.tool_name, description: p.description, input_preview: p.input_preview });
     return;
   }
