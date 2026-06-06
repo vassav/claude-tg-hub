@@ -27,7 +27,7 @@ export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir,
     mcpServers: { hub: { command: 'node', args: [shimPath], env: { SESSION_ID: id, HUB_PORT: String(hubPort), HUB_TOKEN: hubToken, SHIM_LOG: shimLog } } },
   }));
 
-  const args = ['--mcp-config', mcp, '--strict-mcp-config', '--dangerously-load-development-channels', 'server:hub', '--allowedTools', 'mcp__hub__reply'];
+  const args = ['--mcp-config', mcp, '--strict-mcp-config', '--dangerously-load-development-channels', 'server:hub', '--allowedTools', 'mcp__hub__reply,mcp__hub__set_title'];
   if (resumeId) args.push('--resume', resumeId);
   else if (sessionUuid) args.push('--session-id', sessionUuid); // hub controls the conversation UUID → always resumable
 

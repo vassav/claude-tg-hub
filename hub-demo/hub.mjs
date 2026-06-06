@@ -42,6 +42,7 @@ const JANITOR_MS = 30000;                     // periodic reconcile/cleanup
 const DEAD_TTL_MS = 7 * 24 * 3600 * 1000;     // forget resumable entries older than a week
 const STARTING_TTL_MS = 60000;                // discard a 'starting' entry that never registered & wrote nothing
 const ACTIVE_WINDOW_MS = 45000;               // a .jsonl touched within this is treated as a live conversation
+const TITLE_TIMEOUT_MS = 20000;               // wait this long for the model's set_title before slugging the 1st request
 if (!TOKEN) { console.error('HUB_BOT_TOKEN missing in .env'); process.exit(1); }
 if (!OWNER) { console.error('HUB_OWNER_ID missing in .env'); process.exit(1); }
 
@@ -58,6 +59,7 @@ const pendingPerm = new Map(); // request_id -> sessionId
 const outMsgToSession = new Map();
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
+const awaitingTitle = new Set();   // ids whose meaningful name we're awaiting (model set_title, else slug fallback)
 
 // history browse state (snapshot for callback buttons)
 let lastProjects = [];         // [{ dir, cwd, sessions:[{id,mtime,title?}], latest }]
@@ -125,16 +127,55 @@ function upsertRegistry(id, patch) { registry.set(id, { ...(registry.get(id) || 
 function resumableEntries() { return [...registry.values()].filter(e => e.managed && e.status === 'dead' && !sessions.has(e.id)); }
 
 const labelOf = id => sessions.get(id)?.label || registry.get(id)?.label || id;
-// Informative, unique label derived from the project folder (cwd basename).
-// Dedupe only against labels that are actually visible right now (live + resumable),
-// so a single session per folder keeps a clean name instead of drifting to -2/-3.
-function makeLabel(cwd) {
-  let base = (cwd || '').replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || 'session';
-  base = base.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 18) || 'session';
-  const used = new Set([...sessions.values()].map(s => s.label).concat(resumableEntries().map(e => e.label)));
+
+// Labels keep unicode letters/digits (so a Russian request doesn't collapse to
+// 'session'); everything else becomes '-'. Trimmed, capped at 40 chars.
+function sanitizeLabel(s) { return (s || '').normalize('NFC').replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^[-.]+/, '').slice(0, 40).replace(/[-.]+$/, ''); }
+function folderBase(cwd) { return sanitizeLabel((cwd || '').replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || '') || 'session'; }
+// A short slug from free text (first ~7 words) — the auto-name fallback.
+function slugLabel(text) { return sanitizeLabel(String(text || '').trim().split(/\s+/).slice(0, 7).join(' ')); }
+// Labels visible right now (live + resumable), excluding one id — the dedupe set.
+function visibleLabels(exceptId) {
+  const s = new Set();
+  for (const [k, v] of sessions) if (k !== exceptId) s.add(v.label);
+  for (const e of resumableEntries()) if (e.id !== exceptId) s.add(e.label);
+  return s;
+}
+function uniqueLabel(base, exceptId) {
+  base = base || 'session';
+  const used = visibleLabels(exceptId);
   let label = base, i = 2;
   while (used.has(label)) label = `${base}-${i++}`;
   return label;
+}
+// Provisional name at creation: deduped project-folder basename.
+function makeLabel(cwd, exceptId) { return uniqueLabel(folderBase(cwd), exceptId); }
+
+// Give a managed session a meaningful name. fromModel=true (its claude called
+// set_title) overrides an earlier slug fallback; the slug fallback never
+// overrides an existing name. Renames in place — silent (shows on next render).
+function applyName(id, raw, fromModel) {
+  const e = registry.get(id);
+  if (!e) return;
+  if (e.named && !fromModel) return;
+  const label = uniqueLabel(slugLabel(raw) || folderBase(e.cwd), id);
+  e.label = label; e.named = true;
+  const live = sessions.get(id); if (live) live.label = label;
+  awaitingTitle.delete(id);
+  saveRegistry();
+}
+// On the first request to an unnamed managed session, wait for the model's
+// set_title; if it doesn't arrive in time, fall back to slugging that request.
+function armAutoName(id, body) {
+  const e = registry.get(id);
+  if (!e || !e.managed || e.named || awaitingTitle.has(id)) return;
+  const text = String(body || '').trim();
+  if (!/[\p{L}\p{N}]/u.test(text)) return; // nothing nameable (slash command / emoji only)
+  awaitingTitle.add(id);
+  setTimeout(() => {
+    if (registry.get(id)?.named) { awaitingTitle.delete(id); return; }
+    applyName(id, text, false);
+  }, TITLE_TIMEOUT_MS);
 }
 const notify = (text, extra) => bot.api.sendMessage(OWNER, text, extra).catch(() => {});
 function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.conn.write(JSON.stringify(obj) + '\n'); return true; } return false; }
@@ -156,7 +197,8 @@ async function routeTo(ctx, id, body) {
     chat_id: String(ctx.chat.id), message_id: String(ctx.message.message_id),
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
-  if (!sendToSession(id, { t: 'inbound', content: body, meta })) await ctx.reply('⚠️ session not connected');
+  if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return; }
+  armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
 }
 
 // Spawn a session in cwd. Identity is the claude conversation UUID: a NEW session
@@ -311,6 +353,8 @@ net.createServer(sock => {
         else if (!active) active = sid;
         console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${label} = ${sid} (cwd ${m.cwd})`);
         notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${label}\ncwd: ${m.cwd}\nactive: ${labelOf(active)}`, { reply_markup: replyKeyboard() });
+      } else if (m.t === 'title') {
+        applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
         bot.api.sendMessage(m.chat_id || OWNER, `[${labelOf(m.sessionId)}] ${m.text}`)
           .then(sent => { if (sent?.message_id) outMsgToSession.set(sent.message_id, m.sessionId); })

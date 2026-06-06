@@ -83,6 +83,9 @@ function handle(msg) {
         '<channel> block. Your normal/transcript output never reaches them.',
         'Always send a `reply` when you finish a request (so their phone pings), and send brief interim',
         'replies during long tasks. If you need input, ask via `reply` and wait for their next message.',
+        'Right after handling the FIRST user message of a new conversation, call `set_title` ONCE with a',
+        "short (≤40 chars) title summarizing what this session is about, in the user's language.",
+        'Do not announce it in chat — it only names the session for the user.',
       ].join(' '),
     }});
     return;
@@ -93,6 +96,10 @@ function handle(msg) {
       name: 'reply',
       description: 'Send a message to the user over Telegram. Pass chat_id from the inbound <channel> tag and the text to send.',
       inputSchema: { type: 'object', properties: { chat_id: { type: 'string' }, text: { type: 'string' } }, required: ['chat_id', 'text'] },
+    }, {
+      name: 'set_title',
+      description: 'Name this session with a short title (≤40 chars) summarizing what it is about. Call once after the first user message; not shown in chat.',
+      inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
     }] }});
     return;
   }
@@ -101,6 +108,11 @@ function handle(msg) {
     if (params?.name === 'reply') {
       sendHub({ t: 'reply', sessionId: SESSION_ID, chat_id: String(a.chat_id || ''), text: String(a.text ?? '') });
       toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JOIN ? 'sent' : 'hub not joined' }] } });
+      return;
+    }
+    if (params?.name === 'set_title') {
+      sendHub({ t: 'title', sessionId: SESSION_ID, title: String(a.title ?? '') });
+      toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JOIN ? 'session named' : 'hub not joined' }] } });
       return;
     }
     toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `unknown tool: ${params?.name}` }], isError: true } });
