@@ -3,7 +3,9 @@
 ## О проекте
 Единый Telegram-бот-сервис (демон) для управления сессиями Claude Code: список сессий,
 двусторонне (ввод/команды/статус/ответ), уведомления, аппрувы — **равноценно для CLI и для панели VSCode**.
-**Стек:** Node.js + TypeScript. **Стратегия:** fork-plus-build.
+**Стек:** сейчас Node.js + `.mjs` (zero-build); целевой порт — TypeScript. **Подход:** свой
+channels-хаб (см. Статус). *(Исходная стратегия fork-plus-build не понадобилась — путь к движку
+оказался через нативные `channels`.)*
 
 ## Язык и стиль
 - Отвечай на русском. Код — TypeScript.
@@ -11,16 +13,35 @@
 - Для архитектурных развилок давай разбор ТЕКСТОМ (пользователь не любит AskUserQuestion-кнопки для таких решений).
 
 ## Статус и как продолжать
-Этап: дизайн завершён, кода нет. **Следующий шаг — Phase-0 спайк wrapper'а** (см. спеку §9), затем fork-plus-build.
-- Спека: [`docs/specs/2026-06-05-claude-tg-hub-design.md`](docs/specs/2026-06-05-claude-tg-hub-design.md) — читать первой.
-- Research: [`docs/research/2026-06-05-panel-engine-and-wrapper.md`](docs/research/2026-06-05-panel-engine-and-wrapper.md) (как устроена панель + claudeProcessWrapper),
-  [`docs/research/2026-06-05-stack-and-existing-tools.md`](docs/research/2026-06-05-stack-and-existing-tools.md) (стек + fork-plus-build).
-- Архитектура (двухрежимная): `docs/specs/2026-06-05-dualmode-architecture.md` — добавляется по готовности.
+**Рабочий инструмент (beta), запушен в публичный репо** `github.com/vassav/claude-tg-hub`.
+Реализован **CLI-режим через нативные `channels`** (research-preview): один Telegram-бот ↔ много
+сессий Claude Code. Код — в [`hub-demo/`](hub-demo/) на `.mjs` (имя папки историческое).
+Проверено end-to-end на `claude` 2.1.167.
 
-## Ключевые решения (зафиксированы)
-- **Стек = TypeScript** (паритет SDK с Python; перевес Python по UI-automation испаряется, т.к. путь к панели — wrapper/stream-json, не UI-automation).
-- **Два равноценных режима** движка `claude.exe`: CLI (SDK `can_use_tool`/`--permission-prompt-tool`) и Панель (`claudeCode.claudeProcessWrapper`-интерпозер stream-json). Общее ядро: session-registry + approval-bus + Telegram-слой + типы stream-json.
-- **fork-plus-build:** форк Happy Coder (движок, MIT) + Telegram (grammY/telegraf) + доноры ccgram (UX аппрувов) + telclaude (права) + кирпичи claude-code-parser (⚠ лицензия) + FastMCP (CLI-аппрувы). Сами: wrapper-интерпозер панели + двойной режим + единый registry.
+Сделано: мульти-сессионный хаб (один поллер + per-session shim по TCP), маршрутизация, аппрувы
+кнопками, история проектов + resume, **durable-реестр** (переживает рестарт/краш демона: живые
+переподцепляются, мёртвые → ⏸ resume; защита от двойного запуска по PID, краш-safe запись),
+**авто-именование** сессий моделью (`set_title`, иначе слаг первого запроса).
+
+Источник правды сейчас:
+- [`README.md`](README.md) — обзор, установка, команды.
+- [`docs/specs/2026-06-06-channels-validated-and-hub-design.md`](docs/specs/2026-06-06-channels-validated-and-hub-design.md) — проверенный контракт channels + дизайн хаба.
+
+Дальше (не сделано): TS-пакет вместо `.mjs`; кроссплатформенные пути (`TMP`/`CLAUDE_BIN` → env,
+сейчас захардкожены под Windows); многопользовательский доступ; **режим VSCode-панели**
+(через `claudeProcessWrapper`-интерпозер — research в `docs/`, не реализован).
+
+Историческое (исходный дизайн до перехода на channels): [`docs/specs/2026-06-05-claude-tg-hub-design.md`](docs/specs/2026-06-05-claude-tg-hub-design.md), [`docs/research/2026-06-05-panel-engine-and-wrapper.md`](docs/research/2026-06-05-panel-engine-and-wrapper.md), [`docs/research/2026-06-05-stack-and-existing-tools.md`](docs/research/2026-06-05-stack-and-existing-tools.md).
+
+## Ключевые решения
+- **CLI-режим реализован через `channels`** (не через SDK `can_use_tool`/`--permission-prompt-tool`,
+  как планировалось вначале): движок сам пушит входящие и запросы аппрува channel-MCP-серверу
+  (shim), ассистент отвечает MCP-tool'ом `reply`. Это и оказалось рабочим путём к движку.
+- **fork-plus-build не понадобился** — channels закрыли задачу своим кодом (`hub-demo/`). Из
+  доноров (ccgram/telclaude/офиц. telegram-плагин) взяты идеи UX аппрувов и модели доступа, не форк.
+- **Режим VSCode-панели — на будущее**, отдельным путём (`claudeProcessWrapper`-интерпозер
+  stream-json; research см. «Жёсткие факты»). Общее ядро с CLI: registry + approval-bus + Telegram-слой.
+- **Целевой стек — TypeScript** (паритет SDK); текущая рабочая версия — на `.mjs` (zero-build).
 
 ## Жёсткие факты (чтобы не переисследовать)
 - Панель = webview-UI поверх `claude.exe`; разговор/аппрувы по stdio `stream-json` + `control_request{can_use_tool}`. Webview↔host приватен (in-process). Перехват чужой панели снаружи невозможен — только через `claudeProcessWrapper`.
