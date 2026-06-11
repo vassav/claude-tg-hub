@@ -180,6 +180,56 @@ function armAutoName(id, body) {
 const notify = (text, extra) => bot.api.sendMessage(OWNER, text, extra).catch(() => {});
 function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.conn.write(JSON.stringify(obj) + '\n'); return true; } return false; }
 
+// ── Telegram rendering ───────────────────────────────────────────────────────
+// Sessions (panel & CLI) emit Markdown: **bold**, `code`, ```fences```, [t](url),
+// # headers, - bullets. Render it as Telegram HTML — far more forgiving than
+// MarkdownV2 (only < > & need escaping). sendTg falls back to plain text if
+// Telegram still rejects the entities, so a message is never lost; long messages
+// are split under Telegram's 4096-char limit.
+function escapeHtml(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function mdToTgHtml(src) {
+  // Split code spans/blocks out so we never format inside them; odd segments are
+  // the captured code delimiters, even segments are normal text.
+  const parts = String(src ?? '').split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  return parts.map((seg, i) => {
+    if (i % 2 === 1) {
+      const fence = seg.match(/^```[^\n]*\n?([\s\S]*?)```$/);
+      if (fence) return `<pre>${escapeHtml(fence[1].replace(/\n$/, ''))}</pre>`;
+      const inline = seg.match(/^`([^`\n]+)`$/);
+      if (inline) return `<code>${escapeHtml(inline[1])}</code>`;
+      return escapeHtml(seg);
+    }
+    let t = escapeHtml(seg);
+    t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, url) =>                                  // links:
+      /^(https?:\/\/|tg:\/\/|mailto:)/i.test(url) ? `<a href="${url}">${txt}</a>` : `<code>${txt}</code>`); // real URLs stay clickable; file paths → monospace (TG rejects non-FQDN href)
+    t = t.replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>').replace(/__([^\n]+?)__/g, '<b>$1</b>');     // bold
+    t = t.replace(/^#{1,6}\s*(.+)$/gm, '<b>$1</b>');                                              // headers
+    t = t.replace(/^(\s*)[-*]\s+/gm, '$1• ');                                                     // bullets
+    return t;
+  }).join('');
+}
+function chunkText(s, n = 4000) {
+  if (s.length <= n) return [s];
+  const out = []; let cur = '';
+  for (const line of s.split('\n')) {
+    if (line.length > n) { if (cur) { out.push(cur); cur = ''; } for (let i = 0; i < line.length; i += n) out.push(line.slice(i, i + n)); continue; }
+    if (cur && cur.length + line.length + 1 > n) { out.push(cur); cur = ''; }
+    cur = cur ? cur + '\n' + line : line;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+async function sendTg(chatId, text, sid, extra = {}) {
+  const parts = chunkText(String(text ?? ''));
+  for (let i = 0; i < parts.length; i++) {
+    const opts = { link_preview_options: { is_disabled: true }, ...(i === parts.length - 1 ? extra : {}) }; // keyboard only on last chunk
+    let sent = null;
+    try { sent = await bot.api.sendMessage(chatId, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
+    catch { try { sent = await bot.api.sendMessage(chatId, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
+    if (sent?.message_id && sid) outMsgToSession.set(sent.message_id, sid);
+  }
+}
+
 function replyKeyboard() {
   const k = new Keyboard();
   if (order.length) { for (const id of order) k.text(labelOf(id) + (id === active ? ' ✓' : '')); k.row(); }
@@ -375,15 +425,12 @@ net.createServer(sock => {
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
-        bot.api.sendMessage(m.chat_id || OWNER, `[${labelOf(m.sessionId)}] ${m.text}`)
-          .then(sent => { if (sent?.message_id) outMsgToSession.set(sent.message_id, m.sessionId); })
-          .catch(e => console.error('reply send', e?.message));
+        sendTg(m.chat_id || OWNER, `[${labelOf(m.sessionId)}] ${m.text}`, m.sessionId);
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
-        bot.api.sendMessage(OWNER, `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}\n${m.description || ''}\n${(m.input_preview || '').slice(0, 200)}`, { reply_markup: kb })
-          .then(sent => { if (sent?.message_id) outMsgToSession.set(sent.message_id, m.sessionId); })
-          .catch(e => console.error('perm send', e?.message));
+        const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (m.input_preview ? `\n${m.input_preview}` : '');
+        sendTg(OWNER, body, m.sessionId, { reply_markup: kb });
       }
     }
   });

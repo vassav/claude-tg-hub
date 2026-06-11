@@ -20,4 +20,15 @@ inject.txt
 .DS_Store
 Thumbs.db
 .idea/
+.vscode/
 *.swp
+
+# Project artifacts (not for the repo)
+# throwaway spike/verification scripts
+hub-demo/_*.mjs
+# compiled panel wrapper — build from panel-wrapper.cs (paths are machine-specific)
+hub-demo/panel/*.exe
+# abandoned path-2 channel-injection config (superseded by the stdio interposer)
+hub-demo/panel/hub-channel.mcp.json
+# approval/test artifacts
+/test*.txt

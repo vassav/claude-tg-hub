@@ -33,6 +33,11 @@ Claude Code **channels**.
   двойного запуска одного разговора — по живости процесса (PID), а не только по сокету.
 - **Авто-именование**: сама модель называет сессию по первому запросу (`set_title`), иначе —
   слаг запроса (фолбэк через 20с); имена с юникодом (в т.ч. кириллица).
+- **Мост с панелью VSCode**: stdio-интерпозер (через `claudeProcessWrapper`) подключает сессию
+  панели к тому же хабу — ответы зеркалятся в Telegram, сообщения из TG инжектятся в панель как
+  user-turn'ы, аппрувы кнопками по control-протоколу. См. [VSCode-панель](#vscode-панель-мост-через-интерпозер).
+- **Форматирование в Telegram**: ответы сессий рендерятся Markdown→HTML (жирный/код/блоки/ссылки),
+  с плейн-фолбэком и разбивкой длинных сообщений.
 
 ## Архитектура
 
@@ -147,6 +152,20 @@ HUB_JOIN=1 claude --dangerously-load-development-channels plugin:hub@tg-hub-dev
 shim сам найдёт хаб и зарегистрирует сессию; `HUB_JOIN=1` — явный opt-in, чтобы обычные
 сессии не подключались.
 
+## VSCode-панель (мост через интерпозер)
+
+Сессию **панели VSCode** тоже можно подключить к хабу — отдельным путём, т.к. в SDK-режиме
+панели channel-инъекция не запускает ход модели. Stdio-интерпозер садится между расширением и
+`claude.exe` (через настройку `claudeCode.claudeProcessWrapper`), прозрачно форвардит stream-json
+и работает «shim'ом панели»: ответы зеркалит в Telegram, сообщения из TG инжектит как user-turn'ы,
+аппрувы шлёт кнопками (control-протокол `can_use_tool` — на свежих версиях claude он, в отличие от
+channels, не авто-аппрувится). Пока сессия привязана к Telegram, запрос аппрува перехватывается и
+в панель не отдаётся — её диалог не зависает.
+
+Код — в [`hub-demo/panel/`](hub-demo/panel/) (`interposer.mjs` + `panel-wrapper.cs`). Сборка
+wrapper'а, настройка и проверенный stream-json — в спеке
+[`docs/specs/2026-06-11-vscode-panel-bridge.md`](docs/specs/2026-06-11-vscode-panel-bridge.md).
+
 ## Как устроены channels (кратко)
 
 `channel` = MCP-сервер, который в `initialize` объявляет
@@ -167,7 +186,8 @@ shim сам найдёт хаб и зарегистрирует сессию; `H
 - Кастомный канал активируется dev-флагом; managed-allowlist (`allowedChannelPlugins`) — фича
   Team/Enterprise, на личном Pro/Max не применяется.
 - Голый `claude` без `--channels` подцепить задним числом нельзя (анонимный stdio).
-- VSCode-панель не покрыта (отдельный путь — stdio-wrapper).
+- VSCode-панель покрыта отдельным путём (stdio-интерпозер через `claudeProcessWrapper`,
+  см. [спек](docs/specs/2026-06-11-vscode-panel-bridge.md)); пути wrapper'а захардкожены под Windows.
 - Код на `.mjs` (zero-build), один владелец-бот; формальных тестов нет (есть smoke- и
   e2e-проверки). TS-пакет, многопользовательский доступ и кроссплатформенные пути — в планах.
 
@@ -176,6 +196,7 @@ shim сам найдёт хаб и зарегистрирует сессию; `H
 | Папка | |
 |---|---|
 | `hub-demo/` | ядро инструмента: `hub.mjs` (демон), `shim.mjs`, `session.mjs`, `launch.mjs` *(имя папки — историческое)* |
+| `hub-demo/panel/` | мост с панелью VSCode: `interposer.mjs` (stdio-интерпозер ↔ хаб), `panel-wrapper.cs` (wrapper, компилируется в `.exe`) |
 | `spike/channel-server/` | спайк channel-сервера + PTY-тесты (валидация протокола) |
 | `spike/hub-marketplace/` | канал, упакованный плагином (`hub`) + локальный marketplace |
 | `spike/managed-settings/` | helper для `allowedChannelPlugins` |

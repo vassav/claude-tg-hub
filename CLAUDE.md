@@ -23,13 +23,18 @@ channels-хаб (см. Статус). *(Исходная стратегия fork
 переподцепляются, мёртвые → ⏸ resume; защита от двойного запуска по PID, краш-safe запись),
 **авто-именование** сессий моделью (`set_title`, иначе слаг первого запроса).
 
+Реализован и **режим VSCode-панели** — мост через `claudeProcessWrapper`-stdio-интерпозер
+([`hub-demo/panel/`](hub-demo/panel/)): зеркало ответов панели в Telegram, инжект сообщений из TG
+как user-turn'ов, аппрувы кнопками по control-протоколу `can_use_tool` (перехват при привязке
+чата — диалог в панели не зависает). Рендер Markdown→Telegram-HTML — общий в хабе (`mdToTgHtml`).
+
 Источник правды сейчас:
 - [`README.md`](README.md) — обзор, установка, команды.
 - [`docs/specs/2026-06-06-channels-validated-and-hub-design.md`](docs/specs/2026-06-06-channels-validated-and-hub-design.md) — проверенный контракт channels + дизайн хаба.
+- [`docs/specs/2026-06-11-vscode-panel-bridge.md`](docs/specs/2026-06-11-vscode-panel-bridge.md) — проверенный stream-json панели + дизайн моста.
 
-Дальше (не сделано): TS-пакет вместо `.mjs`; кроссплатформенные пути (`TMP`/`CLAUDE_BIN` → env,
-сейчас захардкожены под Windows); многопользовательский доступ; **режим VSCode-панели**
-(через `claudeProcessWrapper`-интерпозер — research в `docs/`, не реализован).
+Дальше (не сделано): TS-пакет вместо `.mjs`; кроссплатформенные пути (`TMP`/`CLAUDE_BIN`/пути
+wrapper'а → env, сейчас захардкожены под Windows); многопользовательский доступ.
 
 Историческое (исходный дизайн до перехода на channels): [`docs/specs/2026-06-05-claude-tg-hub-design.md`](docs/specs/2026-06-05-claude-tg-hub-design.md), [`docs/research/2026-06-05-panel-engine-and-wrapper.md`](docs/research/2026-06-05-panel-engine-and-wrapper.md), [`docs/research/2026-06-05-stack-and-existing-tools.md`](docs/research/2026-06-05-stack-and-existing-tools.md).
 
@@ -39,8 +44,10 @@ channels-хаб (см. Статус). *(Исходная стратегия fork
   (shim), ассистент отвечает MCP-tool'ом `reply`. Это и оказалось рабочим путём к движку.
 - **fork-plus-build не понадобился** — channels закрыли задачу своим кодом (`hub-demo/`). Из
   доноров (ccgram/telclaude/офиц. telegram-плагин) взяты идеи UX аппрувов и модели доступа, не форк.
-- **Режим VSCode-панели — на будущее**, отдельным путём (`claudeProcessWrapper`-интерпозер
-  stream-json; research см. «Жёсткие факты»). Общее ядро с CLI: registry + approval-bus + Telegram-слой.
+- **Режим VSCode-панели реализован** отдельным путём — `claudeProcessWrapper`-stdio-интерпозер
+  (`hub-demo/panel/`), а НЕ channel-инъекцией: в SDK-режиме панели channel-сообщения не запускают
+  ход модели. Интерпозер форвардит stream-json и одновременно работает «shim'ом панели» к хабу.
+  Общее ядро с CLI: registry + approval-bus + Telegram-слой (рендер Markdown→TG-HTML — общий, в хабе).
 - **Целевой стек — TypeScript** (паритет SDK); текущая рабочая версия — на `.mjs` (zero-build).
 
 ## Жёсткие факты (чтобы не переисследовать)
