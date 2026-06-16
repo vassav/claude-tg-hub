@@ -16,7 +16,7 @@
 //     process is still alive (PID liveness), so we never double-write one .jsonl.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -33,7 +33,9 @@ const OWNER = String(process.env.HUB_OWNER_ID || '');
 const PORT = Number(process.env.HUB_PORT || 8799);
 const IPC_TOKEN = process.env.HUB_TOKEN || 'dev';
 const SHIM = join(HERE, 'shim.mjs');
-const TMP = 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions';
+const TMP = process.env.HUB_TMP_DIR || (process.platform === 'win32'
+  ? 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions'
+  : join(tmpdir(), 'hubsessions'));
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 const HUB_CFG_DIR = join(homedir(), '.claude', 'channels', 'hub');
 const REG_FILE = join(HUB_CFG_DIR, 'registry.json');
@@ -56,6 +58,7 @@ const bot = new Bot(TOKEN);
 const sessions = new Map();    // sessionId -> { conn, cwd, label }  (LIVE only — has a socket)
 const order = [];
 const pendingPerm = new Map(); // request_id -> sessionId
+const permMsg = new Map();      // request_id -> approval-card message_id (OWNER chat), for clearing buttons
 const outMsgToSession = new Map();
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
@@ -221,13 +224,16 @@ function chunkText(s, n = 4000) {
 }
 async function sendTg(chatId, text, sid, extra = {}) {
   const parts = chunkText(String(text ?? ''));
+  let last = null;
   for (let i = 0; i < parts.length; i++) {
     const opts = { link_preview_options: { is_disabled: true }, ...(i === parts.length - 1 ? extra : {}) }; // keyboard only on last chunk
     let sent = null;
     try { sent = await bot.api.sendMessage(chatId, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
     catch { try { sent = await bot.api.sendMessage(chatId, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
     if (sent?.message_id && sid) outMsgToSession.set(sent.message_id, sid);
+    if (sent) last = sent;
   }
+  return last;
 }
 
 function replyKeyboard() {
@@ -255,7 +261,7 @@ async function routeTo(ctx, id, body) {
 // gets a hub-generated UUID used as BOTH --session-id and our registry/shim key,
 // so we can always resume it later. Resuming passes that same UUID via --resume.
 // Guards prevent double-spawning one conversation. Returns ok.
-function startSession(cwd, { resumeUuid } = {}) {
+function startSession(cwd, { resumeUuid, extraMcpServers, extraAllowedTools } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
   if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return false; }
@@ -268,7 +274,7 @@ function startSession(cwd, { resumeUuid } = {}) {
   pendingActivate.add(id);
   let child;
   try {
-    child = spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN });
+    child = spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN, extraMcpServers, extraAllowedTools });
   } catch (e) { pendingActivate.delete(id); registry.delete(id); saveRegistry(); notify(`start failed: ${e?.message}`); return false; }
   // Record the REAL claude pid now (from the pty child), independent of the shim
   // registering — so the liveness guard holds during the spawn→register window.
@@ -442,7 +448,28 @@ net.createServer(sock => {
         pendingPerm.set(m.request_id, m.sessionId);
         const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
         const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (m.input_preview ? `\n${m.input_preview}` : '');
-        sendTg(OWNER, body, m.sessionId, { reply_markup: kb });
+        sendTg(OWNER, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+      } else if (m.t === 'approval_cancel') {
+        // The session answered this approval elsewhere (e.g. in the VSCode panel) —
+        // drop the now-stale Telegram buttons.
+        pendingPerm.delete(m.request_id);
+        const mid = permMsg.get(m.request_id); permMsg.delete(m.request_id);
+        if (mid) bot.api.editMessageText(OWNER, mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
+      } else if (m.t === 'inject') {
+        // External, programmatic inbound (a local consumer process, NOT a human in
+        // Telegram). Authenticated like register; target is a live session's id or
+        // label; delivered exactly like routeTo. This socket isn't a registered
+        // session (sid stays null) — it's a one-shot request/response.
+        if (m.token !== IPC_TOKEN) { sock.end(); return; }
+        const id = order.find(x => x === m.target || labelOf(x) === m.target);
+        const meta = { ...(m.meta || {}) };
+        if (!meta.chat_id) meta.chat_id = OWNER; // replies default to the owner's chat
+        if (id && sendToSession(id, { t: 'inbound', content: m.content, meta })) {
+          armAutoName(id, m.content);
+          sock.write(JSON.stringify({ ok: true }) + '\n');
+        } else {
+          sock.write(JSON.stringify({ ok: false, error: 'session not connected' }) + '\n');
+        }
       }
     }
   });
@@ -542,6 +569,7 @@ bot.on('callback_query:data', async ctx => {
     const [, rid, behavior] = m;
     const s = pendingPerm.get(rid);
     if (s) { sendToSession(s, { t: 'permission_decision', request_id: rid, behavior }); pendingPerm.delete(rid); }
+    permMsg.delete(rid);
     await ctx.answerCallbackQuery({ text: behavior === 'allow' ? 'Allowed' : 'Denied' }).catch(() => {});
     await ctx.editMessageText(`${ctx.callbackQuery.message?.text || ''}\n\n${behavior === 'allow' ? '✅ Allowed' : '❌ Denied'}`).catch(() => {});
     return;

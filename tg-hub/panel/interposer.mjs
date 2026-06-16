@@ -120,7 +120,7 @@ function injectUser(text) {
 }
 
 // ── 3d: approvals (variant B — dual, first responder wins) ───────────────────
-const approvals = new Map();    // realId(uuid) -> { synthId, input, toolUseId, resolved }
+const approvals = new Map();    // realId(uuid) -> { synthId, input, toolUseId, resolved, tgResolved }
 const synthToReal = new Map();  // synthId([a-z]{5}) -> realId  (hub's perm buttons key on [a-z]{5})
 function newSynthId() { let s; do { s = Array.from({ length: 5 }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join(''); } while (synthToReal.has(s)); return s; }
 function toolPreview(tool, input) {
@@ -135,9 +135,9 @@ function toolPreview(tool, input) {
 function offerApproval(req, request_id) {
   if (!boundChatId) return;   // only route to TG once a remote user is engaged with this session
   const synthId = newSynthId();
-  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false });
-  synthToReal.set(synthId, request_id);
   const tool = req.tool_name || req.display_name || 'tool';
+  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false, tool });
+  synthToReal.set(synthId, request_id);
   sendHub({ t: 'permission_request', sessionId, request_id: synthId,
     tool_name: tool,
     description: req.description || '',
@@ -149,28 +149,37 @@ function resolveApproval(synthId, behavior) {
   if (!realId) return;
   const a = approvals.get(realId);
   if (!a || a.resolved) return;   // already answered (by the panel, or a prior verdict)
-  a.resolved = true;
+  a.resolved = true; a.tgResolved = true;
+  // 1) dismiss the panel's own dialog for this request the way the engine does on
+  //    interrupt — the extension acks with an abort control_response that onIn drops
+  //    (the engine must only ever see our verdict below, not that abort).
+  try { process.stdout.write(JSON.stringify({ type: 'control_cancel_request', request_id: realId }) + '\n'); } catch {}
+  // 2) give the engine the verdict so the tool proceeds / is denied.
   const response = behavior === 'allow'
     ? { behavior: 'allow', updatedInput: a.input, updatedPermissions: [], toolUseID: a.toolUseId }
     : { behavior: 'deny', message: 'Denied via Telegram' };
   const ctl = { type: 'control_response', response: { subtype: 'success', request_id: realId, response } };
-  try { child.stdin.write(JSON.stringify(ctl) + '\n'); log('INJECT verdict', { realId, behavior }); }
+  try { child.stdin.write(JSON.stringify(ctl) + '\n'); log('INJECT verdict + cancel panel dialog', { realId, behavior }); }
   catch (e) { log('verdict inject err', String(e)); }
 }
 
 // ── direction taps & forwarding ──────────────────────────────────────────────
 const DROP = Symbol('drop');   // onOut returns this to suppress forwarding a line (intercept)
-function makeTap(dir, onObj) {  // IN side: observe only; the byte-pipe does the forwarding
+// IN side: forward each complete line to the engine UNLESS onIn intercepts it
+// (returns DROP — used to swallow the panel's abort-ack to a TG-answered approval).
+function inForwarder() {
   let buf = '';
   return chunk => {
     buf += chunk.toString('utf8');
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {
       const l = buf.slice(0, i); buf = buf.slice(i + 1);
-      if (!l.trim()) continue;
-      logLine(dir, l);
-      let o; try { o = JSON.parse(l); } catch { continue; }
-      try { onObj(o); } catch (e) { log('tap handler err', String(e)); }
+      if (!l.trim()) { child.stdin.write(l + '\n'); continue; }
+      logLine('IN  >>', l);
+      let o = null, drop = false;
+      try { o = JSON.parse(l); } catch {}
+      if (o) { try { drop = onIn(o) === DROP; } catch (e) { log('onIn err', String(e)); } }
+      if (!drop) child.stdin.write(l + '\n');
     }
   };
 }
@@ -208,12 +217,13 @@ function onOut(o) {                                   // engine -> extension
     sendHub({ t: 'title', sessionId, title: String(o.response.response.title).slice(0, 60) });
     return;
   }
-  // tool approval request: when a TG user is bound, INTERCEPT it (route to Telegram,
-  // suppress the panel's own dialog so nothing is left dangling in the VSCode UI);
-  // with no TG user bound, let it pass through for the panel to approve locally.
+  // tool approval request: forward it to the panel (its own dialog) AND, when a TG
+  // user is bound, also mirror it to Telegram buttons. Dual approval — whoever
+  // answers first wins: a TG answer cancels the panel dialog (see resolveApproval);
+  // a panel answer leaves the TG buttons as a harmless no-op.
   if (o.type === 'control_request' && o.request?.subtype === 'can_use_tool') {
-    if (boundChatId) { offerApproval(o.request, o.request_id); return DROP; }
-    return;
+    if (boundChatId) offerApproval(o.request, o.request_id);
+    return;   // never DROP — the panel keeps showing its own dialog
   }
   // 3b mirror: assistant text -> Telegram (only once a TG user is bound)
   if (o.type === 'assistant' && o.message?.content && boundChatId) {
@@ -224,10 +234,16 @@ function onOut(o) {                                   // engine -> extension
   }
 }
 function onIn(o) {                                    // extension -> engine
-  // variant B: if the panel answered an approval first, stop waiting on TG for it
-  if (o.type === 'control_response' && o.response?.request_id && approvals.has(o.response.request_id)) {
-    const a = approvals.get(o.response.request_id);
-    if (a && !a.resolved) { a.resolved = true; log('approval resolved by panel', { realId: o.response.request_id }); }
+  // control_response to a tracked approval:
+  //  • if we already answered it from Telegram, this is the extension's abort-ack to
+  //    our control_cancel_request → DROP it so the engine isn't double-answered.
+  //  • otherwise the panel answered first → mark resolved (a later TG tap no-ops) and
+  //    let the panel's response flow through to the engine.
+  const rid = (o.type === 'control_response') ? o.response?.request_id : null;
+  if (rid && approvals.has(rid)) {
+    const a = approvals.get(rid);
+    if (a.tgResolved) return DROP;
+    if (!a.resolved) { a.resolved = true; log('approval answered in panel', { realId: rid }); sendHub({ t: 'approval_cancel', sessionId, request_id: a.synthId, tool: a.tool }); }
   }
 }
 
@@ -238,13 +254,10 @@ raw(`\n[${new Date().toISOString()}] ===== INTERPOSER START (bridge=${BRIDGE}) =
 
 const child = spawn(exe, rest, { stdio: ['pipe', 'pipe', 'inherit'] });   // stderr passes straight through
 
-// Transparent byte forwarding (pipe handles backpressure) + a separate tap that
-// only observes/bridges. Our own writes to child.stdin (inject/verdict) interleave
-// at line boundaries with the piped extension bytes.
-process.stdin.pipe(child.stdin);
-process.stdin.on('data', makeTap('IN  >>', onIn));
-// OUT is NOT blind-piped: outForwarder forwards line-by-line so it can DROP an
-// intercepted can_use_tool (keeps the panel UI clean when a TG user is bound).
+// Neither direction is blind-piped: both forward line-by-line so we can DROP a line
+// when needed (IN: the panel's abort-ack to a TG-answered approval). Our own writes
+// to child.stdin (inject/verdict) interleave at line boundaries with forwarded bytes.
+process.stdin.on('data', inForwarder());
 child.stdout.on('data', outForwarder());
 
 process.stdin.on('end', () => { try { child.stdin.end(); } catch {} });

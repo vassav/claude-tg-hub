@@ -3,6 +3,7 @@
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { spawnSession } from './session.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -17,7 +18,9 @@ process.on('unhandledRejection', e => console.error('[launch] unhandledRejection
 const HUB_PORT = process.env.HUB_PORT || 8799;
 const HUB_TOKEN = process.env.HUB_TOKEN || 'dev';
 const SHIM = join(HERE, 'shim.mjs');
-const TMP = 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions';
+const TMP = process.env.HUB_TMP_DIR || (process.platform === 'win32'
+  ? 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions'
+  : join(tmpdir(), 'hubsessions'));
 
 const SESSIONS = [
   { id: 'sess-A', cwd: join(TMP, 'A') },

@@ -5,8 +5,9 @@ import pty from 'node-pty';
 import { writeFileSync, mkdirSync, existsSync, appendFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
-const CLAUDE = process.env.CLAUDE_BIN
-  || 'C:\\Users\\vsavinov\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe';
+const CLAUDE = process.env.CLAUDE_BIN || (process.platform === 'win32'
+  ? 'C:\\Users\\vsavinov\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe'
+  : 'claude');
 
 // id          — our hub-side key for the shim (SESSION_ID); for managed sessions
 //               this equals the claude conversation UUID
@@ -16,7 +17,10 @@ const CLAUDE = process.env.CLAUDE_BIN
 //               so the hub records it and can always resume the session later
 // shimPath    — absolute path to shim.mjs
 // tmpDir      — scratch dir for per-session mcp.json + logs
-export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir, hubPort, hubToken }) {
+// extraMcpServers   — optional extra mcpServers (consumer tools) merged next to `hub`
+// extraAllowedTools — optional string|string[] appended to --allowedTools; empty by
+//                     default so extra tools are NOT auto-allowed (they go through approval)
+export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir, hubPort, hubToken, extraMcpServers, extraAllowedTools }) {
   mkdirSync(cwd, { recursive: true });
   mkdirSync(tmpDir, { recursive: true });
   const mcp = join(tmpDir, id + '.mcp.json');
@@ -24,10 +28,13 @@ export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir,
   const ptyLog = join(tmpDir, id + '.pty.log');
 
   writeFileSync(mcp, JSON.stringify({
-    mcpServers: { hub: { command: 'node', args: [shimPath], env: { SESSION_ID: id, HUB_PORT: String(hubPort), HUB_TOKEN: hubToken, SHIM_LOG: shimLog } } },
+    mcpServers: { hub: { command: 'node', args: [shimPath], env: { SESSION_ID: id, HUB_PORT: String(hubPort), HUB_TOKEN: hubToken, SHIM_LOG: shimLog } }, ...(extraMcpServers || {}) },
   }));
 
-  const args = ['--mcp-config', mcp, '--strict-mcp-config', '--dangerously-load-development-channels', 'server:hub', '--allowedTools', 'mcp__hub__reply,mcp__hub__set_title'];
+  const baseAllowed = 'mcp__hub__reply,mcp__hub__set_title';
+  const extra = Array.isArray(extraAllowedTools) ? extraAllowedTools.join(',') : (extraAllowedTools || '');
+  const allowed = extra ? `${baseAllowed},${extra}` : baseAllowed;
+  const args = ['--mcp-config', mcp, '--strict-mcp-config', '--dangerously-load-development-channels', 'server:hub', '--allowedTools', allowed];
   if (resumeId) args.push('--resume', resumeId);
   else if (sessionUuid) args.push('--session-id', sessionUuid); // hub controls the conversation UUID → always resumable
 
