@@ -2,8 +2,12 @@
 // attached, auto-confirming startup prompts. Optional resumeId continues a past
 // conversation (claude --resume <id>). Used by both launch.mjs and hub.mjs.
 import pty from 'node-pty';
+import { spawn } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync, appendFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const CLAUDE = process.env.CLAUDE_BIN || (process.platform === 'win32'
   ? 'C:\\Users\\vsavinov\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe'
@@ -21,6 +25,11 @@ const CLAUDE = process.env.CLAUDE_BIN || (process.platform === 'win32'
 // extraAllowedTools — optional string|string[] appended to --allowedTools; empty by
 //                     default so extra tools are NOT auto-allowed (they go through approval)
 export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir, hubPort, hubToken, extraMcpServers, extraAllowedTools }) {
+  // Variant A: hub-launched sessions on stream-json via the headless client
+  // (control-protocol capable). Opt-in via HUB_STREAM=1 during bring-up; channels
+  // (below) stays the default until the stream path is verified live.
+  if (process.env.HUB_STREAM === '1')
+    return spawnStreamSession({ id, cwd, resumeId, sessionUuid, tmpDir, hubPort, hubToken, extraMcpServers, extraAllowedTools });
   mkdirSync(cwd, { recursive: true });
   mkdirSync(tmpDir, { recursive: true });
   const mcp = join(tmpDir, id + '.mcp.json');
@@ -57,4 +66,32 @@ export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir,
   }, 1200);
 
   return p;
+}
+
+// Variant A: spawn `node headless.mjs <claude> <stream-json args>`. The headless
+// client spawns claude in stream-json (pipes, no PTY, no channels/shim), does the
+// initialize handshake and bridges the session into the hub — so control-protocol
+// commands (/context, /rc, /limits, /interrupt) work like the VSCode panel.
+function spawnStreamSession({ id, cwd, resumeId, sessionUuid, tmpDir, hubPort, hubToken, extraMcpServers, extraAllowedTools }) {
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(tmpDir, { recursive: true });
+
+  const sjArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+    '--permission-prompt-tool', 'stdio', '--include-partial-messages', '--replay-user-messages'];
+  // Optional consumer MCP servers (no `hub` server here — the headless client IS the bridge).
+  if (extraMcpServers && Object.keys(extraMcpServers).length) {
+    const mcp = join(tmpDir, id + '.mcp.json');
+    writeFileSync(mcp, JSON.stringify({ mcpServers: { ...extraMcpServers } }));
+    sjArgs.push('--mcp-config', mcp, '--strict-mcp-config');
+  }
+  const extra = Array.isArray(extraAllowedTools) ? extraAllowedTools.join(',') : (extraAllowedTools || '');
+  if (extra) sjArgs.push('--allowedTools', extra); // default empty → all tools gated via approval
+  if (resumeId) sjArgs.push('--resume', resumeId);
+  else if (sessionUuid) sjArgs.push('--session-id', sessionUuid);
+
+  const childEnv = { ...process.env, SESSION_ID: id, HUB_PORT: String(hubPort), HUB_TOKEN: hubToken };
+  delete childEnv.HUB_BOT_TOKEN; // sessions don't need the bot secret (HUB_OWNER_ID stays for reply fallback)
+
+  const headless = join(HERE, 'panel', 'headless.mjs');
+  return spawn(process.execPath, [headless, CLAUDE, ...sjArgs], { stdio: ['ignore', 'inherit', 'inherit'], cwd, env: childEnv });
 }

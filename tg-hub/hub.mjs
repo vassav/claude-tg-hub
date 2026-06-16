@@ -242,9 +242,15 @@ function replyKeyboard() {
   k.text('/sessions').text('/projects');
   return k.resized();
 }
+// stream-json sessions (VSCode panel, or hub-launched headless) are control-capable:
+// they accept /context, /rc, /limits, /compact, /interrupt. Channels CLI sessions are not.
+const isStream = id => sessions.get(id)?.kind === 'stream';
 function sessionInline() {
   const k = new InlineKeyboard();
-  for (const id of order) { k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
+  for (const id of order) {
+    k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row();
+    if (isStream(id)) k.text('🧮 ctx', `cmd:${id}:context`).text('🌐 rc', `cmd:${id}:rc`).text('⏳ lim', `cmd:${id}:limits`).text('🗜', `cmd:${id}:compact`).text('⏹', `cmd:${id}:interrupt`).row();
+  }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
   return k;
 }
@@ -423,7 +429,7 @@ net.createServer(sock => {
         // Replace a superseded live connection deterministically (avoid orphan/leak).
         const prev = sessions.get(sid);
         if (prev?.conn && prev.conn !== sock) { try { prev.conn.destroy(); } catch {} }
-        sessions.set(sid, { conn: sock, cwd: m.cwd, label });
+        sessions.set(sid, { conn: sock, cwd: m.cwd, label, kind: m.kind || 'cli' });
         if (!order.includes(sid)) order.push(sid);
         if (managed) {
           upsertRegistry(sid, {
@@ -534,6 +540,18 @@ bot.command('new', async ctx => {
   if (startSession(cwd)) await ctx.reply(`➕ starting new session in ${cwd}…`);
 });
 
+// Panel/stream commands → forwarded to the active control-capable session, which
+// runs them over the stream-json control-protocol and replies via the hub.
+for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt']) {
+  bot.command(name, async ctx => {
+    if (!owns(ctx)) return;
+    const id = active;
+    if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
+    if (!isStream(id)) { await ctx.reply('⚙️ доступно только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
+    sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
+  });
+}
+
 bot.on('callback_query:data', async ctx => {
   if (!owns(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }
   const data = ctx.callbackQuery.data;
@@ -562,6 +580,15 @@ bot.on('callback_query:data', async ctx => {
     registry.delete(id); saveRegistry();
     await ctx.answerCallbackQuery({ text: 'forgotten' }).catch(() => {});
     await ctx.editMessageReplyMarkup({ reply_markup: sessionInline() }).catch(() => {});
+    return;
+  }
+
+  if ((m = /^cmd:(.+):(context|rc|limits|compact|interrupt)$/.exec(data))) {
+    const [, id, name] = m;
+    if (!sessions.has(id)) { await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {}); return; }
+    if (!isStream(id)) { await ctx.answerCallbackQuery({ text: 'только для stream-сессий' }).catch(() => {}); return; }
+    sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
+    await ctx.answerCallbackQuery({ text: name }).catch(() => {});
     return;
   }
 

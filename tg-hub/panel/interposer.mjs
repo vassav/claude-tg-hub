@@ -28,6 +28,7 @@ import { join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { createCommands } from './commands.mjs';
 
 // ── logging ──────────────────────────────────────────────────────────────────
 const LOG = process.env.PANEL_INTERPOSER_LOG || join(tmpdir(), 'panel-interposer.log');
@@ -93,7 +94,7 @@ function sendHub(m) { if (!BRIDGE) return; if (hubReady && hub) hub.write(JSON.s
 function tryRegister() {
   if (registered || !hubReady || !sessionId) return;
   registered = true;
-  hub.write(JSON.stringify({ t: 'register', sessionId, token: HUB_TOKEN, cwd, ppid: child?.pid || process.pid }) + '\n');
+  hub.write(JSON.stringify({ t: 'register', sessionId, token: HUB_TOKEN, cwd, ppid: child?.pid || process.pid, kind: 'stream' }) + '\n');
   log('registered with hub', { sessionId, cwd });
 }
 function onHub(m) {
@@ -103,6 +104,8 @@ function onHub(m) {
     injectUser(String(m.content ?? ''));
   } else if (m.t === 'permission_decision') {
     resolveApproval(m.request_id, m.behavior);
+  } else if (m.t === 'command') {
+    cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || ''));
   } else if (m.t === 'stop') {
     log('stop -> killing engine child', { pid: child?.pid });
     try { child.kill(); } catch {}
@@ -118,6 +121,13 @@ function injectUser(text) {
   try { child.stdin.write(JSON.stringify(msg) + '\n'); log('INJECT user', text.slice(0, 120)); }
   catch (e) { log('inject err', String(e)); }
 }
+
+// shared control-protocol command logic (also used by the headless client). Issues
+// control_requests to the engine; their responses are captured/DROPped in onOut.
+const cmds = createCommands({
+  toEngine: obj => { try { child.stdin.write(JSON.stringify(obj) + '\n'); } catch (e) { log('ctl write err', String(e)); } },
+  sendHub, sessionId: () => sessionId, owner: process.env.HUB_OWNER_ID || '', injectUser,
+});
 
 // ── 3d: approvals (variant B — dual, first responder wins) ───────────────────
 const approvals = new Map();    // realId(uuid) -> { synthId, input, toolUseId, resolved, tgResolved }
@@ -212,6 +222,11 @@ function onOut(o) {                                   // engine -> extension
     tryRegister();
     return;
   }
+  // our own control-command responses (/context, /rc) — formatted + sent to Telegram,
+  // and DROPped so the extension never sees a response it didn't request.
+  if (o.type === 'control_response' && cmds.onControlResponse(o)) return DROP;
+  // passive 5-hour rate limit (forwarded to the panel as usual)
+  if (o.type === 'rate_limit_event') { cmds.noteRateLimit(o.rate_limit_info); return; }
   // engine-generated session title -> name the hub session
   if (o.type === 'control_response' && o.response?.response?.title) {
     sendHub({ t: 'title', sessionId, title: String(o.response.response.title).slice(0, 60) });
