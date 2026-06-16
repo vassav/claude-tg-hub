@@ -67,6 +67,7 @@ const permMsg = new Map();      // request_id -> approval-card message_id (home 
 const outMsgToSession = new Map();
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
+const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
 const awaitingTitle = new Set();   // ids whose meaningful name we're awaiting (model set_title, else slug fallback)
 
 // history browse state (snapshot for callback buttons)
@@ -284,22 +285,24 @@ async function routeTo(ctx, id, body) {
 // Spawn a session in cwd. Identity is the claude conversation UUID: a NEW session
 // gets a hub-generated UUID used as BOTH --session-id and our registry/shim key,
 // so we can always resume it later. Resuming passes that same UUID via --resume.
-// Guards prevent double-spawning one conversation. Returns ok.
+// Guards prevent double-spawning one conversation. Returns the session id (string)
+// on success, or null if a guard rejected (callers using `if (startSession(...))`
+// still work: a uuid string is truthy, null is falsy).
 function startSession(cwd, { resumeUuid, extraMcpServers, extraAllowedTools } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
-  if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return false; }
-  if (isOwnLive(e0)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return false; }
+  if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return null; }
+  if (isOwnLive(e0)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return null; }
   if (resumeUuid) {
-    if (!conversationExists(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — its history is gone`); registry.delete(id); saveRegistry(); return false; }
-    if (jsonlFresh(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return false; }
-    if (liveCwdConflict(id, cwd)) { notify(`can't resume ${id.slice(0, 8)} — another live session is in ${cwd}`); return false; }
+    if (!conversationExists(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — its history is gone`); registry.delete(id); saveRegistry(); return null; }
+    if (jsonlFresh(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return null; }
+    if (liveCwdConflict(id, cwd)) { notify(`can't resume ${id.slice(0, 8)} — another live session is in ${cwd}`); return null; }
   }
   pendingActivate.add(id);
   let child;
   try {
     child = spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN, extraMcpServers, extraAllowedTools });
-  } catch (e) { pendingActivate.delete(id); registry.delete(id); saveRegistry(); notify(`start failed: ${e?.message}`); return false; }
+  } catch (e) { pendingActivate.delete(id); registry.delete(id); saveRegistry(); notify(`start failed: ${e?.message}`); return null; }
   // Record the REAL claude pid now (from the pty child), independent of the shim
   // registering — so the liveness guard holds during the spawn→register window.
   upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: child?.pid ?? null, bootId: BOOT_ID, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now() });
@@ -314,7 +317,7 @@ function startSession(cwd, { resumeUuid, extraMcpServers, extraAllowedTools } = 
   notify(resumeUuid
     ? `▶ resuming ${id.slice(0, 8)}… in ${cwd}\nit'll reconnect and become active.`
     : `➕ new session in ${cwd}\nit'll appear and become active shortly.`);
-  return true;
+  return id;
 }
 
 // Periodic reconcile: resolve detached→dead/discard via PID, drop phantoms, TTL-prune.
@@ -464,6 +467,9 @@ net.createServer(sock => {
         else if (!active) active = sid;
         console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${labelOf(sid)} = ${sid} (cwd ${m.cwd})`);
         notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${labelOf(sid)}\ncwd: ${m.cwd}\nactive: ${labelOf(active)}`, { reply_markup: replyKeyboard() });
+        // External {t:'start',content}: deliver the queued first message now that it's live.
+        const first = pendingFirstMsg.get(sid);
+        if (first) { pendingFirstMsg.delete(sid); if (sendToSession(sid, { t: 'inbound', content: first.content, meta: first.meta })) armAutoName(sid, first.content); }
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
@@ -494,6 +500,24 @@ net.createServer(sock => {
         } else {
           sock.write(JSON.stringify({ ok: false, error: 'session not connected' }) + '\n');
         }
+      } else if (m.t === 'start') {
+        // External, programmatic session creation (symmetric to inject): spawn a new
+        // hub-MANAGED session (durable/resumable, owned by the daemon) in `cwd`, or
+        // resume `resume` (a known uuid). Optional `content` is injected as the first
+        // user-turn once it registers; optional extraMcpServers/extraAllowedTools are
+        // passed through to spawnSession. Replies to {ok:true,id} so the consumer can
+        // later target it via inject. Not a registered session (sid stays null).
+        if (m.token !== IPC_TOKEN) { sock.end(); return; }
+        const cwd = m.resume ? (registry.get(m.resume)?.cwd || m.cwd) : m.cwd;
+        if (!cwd) { sock.write(JSON.stringify({ ok: false, error: 'cwd required (or resume an unknown uuid)' }) + '\n'); return; }
+        const newId = startSession(cwd, { resumeUuid: m.resume || undefined, extraMcpServers: m.extraMcpServers, extraAllowedTools: m.extraAllowedTools });
+        if (!newId) { sock.write(JSON.stringify({ ok: false, error: 'could not start (already running / history gone / cwd conflict)' }) + '\n'); return; }
+        if (m.content != null && String(m.content) !== '') {
+          const meta = { ...(m.meta || {}) };
+          if (!meta.chat_id) meta.chat_id = CHAT;
+          pendingFirstMsg.set(newId, { content: String(m.content), meta });
+        }
+        sock.write(JSON.stringify({ ok: true, id: newId }) + '\n');
       }
     }
   });

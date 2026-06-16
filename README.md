@@ -177,6 +177,39 @@ HUB_JOIN=1 claude --dangerously-load-development-channels plugin:hub@tg-hub-dev
 shim сам найдёт хаб и зарегистрирует сессию; `HUB_JOIN=1` — явный opt-in, чтобы обычные
 сессии не подключались.
 
+## External IPC (создание/инжект из своей тулзы)
+
+Локальный процесс-консьюмер (НЕ человек в Telegram) может программно управлять хабом по тому же
+TCP-IPC: подключиться к `127.0.0.1:<HUB_PORT>`, прочитать `port`/`token` из
+`~/.claude/channels/hub/hub.json` (или взять из env `HUB_PORT`/`HUB_TOKEN`) и слать
+**newline-terminated JSON**. Неверный `token` → сокет закрывается.
+
+**`start`** — создать новую managed-сессию (durable/resumable, процессом владеет демон) или
+возобновить известную:
+```json
+{"t":"start","token":"<HUB_TOKEN>","cwd":"d:/path/to/project",
+ "resume":"<uuid|опц.>","content":"первый ход (опц.)","meta":{"chat_id":"<опц.>"},
+ "extraMcpServers":{"<name>":{"command":"node","args":["mcp.mjs"]}},"extraAllowedTools":["mcp__name__tool"]}
+```
+→ `{"ok":true,"id":"<uuid>"}` (или `{"ok":false,"error":…}`). `content` инжектится первым
+ходом, как только сессия зарегистрируется. `resume` берёт `cwd` из реестра, если не передан.
+Доп. MCP-серверы консьюмера видны сессии; их тулы проходят обычный аппрув кнопками (если не
+перечислены в `extraAllowedTools`).
+
+**`inject`** — отправить сообщение в **уже живую** сессию (как обычное входящее):
+```json
+{"t":"inject","token":"<HUB_TOKEN>","target":"<label|id>","content":"привет","meta":{"chat_id":"<опц.>"}}
+```
+→ `{"ok":true}` или `{"ok":false,"error":"session not connected"}`.
+
+Нюансы:
+- После `start` сессия становится «живой» через ~1–2с (регистрация). Слишком ранний `inject`
+  вернёт `session not connected` — либо ретрай до `{ok:true}`, либо передавай первый ход прямо
+  в `start.content`.
+- `meta.chat_id` по умолчанию = «домашний» чат (`HUB_CHAT_ID` или личка владельца) — туда уйдут
+  ответы и аппрувы сессии.
+- Стоп-IPC намеренно нет: завершай сессию из Telegram (`/stop`/🛑).
+
 ## VSCode-панель (мост через интерпозер)
 
 Сессию **панели VSCode** тоже можно подключить к хабу — отдельным путём, т.к. в SDK-режиме
