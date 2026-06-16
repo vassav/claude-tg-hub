@@ -3,7 +3,7 @@
 // commands to the stream-json control-protocol the panel itself uses:
 //   /context   -> control_request{get_context_usage}  -> categories/percentage
 //   /rc        -> control_request{remote_control}      -> session_url
-//   /limits    -> cached rate_limit_event (5-hour)
+//   /limits    -> control_request{get_usage}          -> rate_limits (5h + weekly %)
 //   /interrupt -> control_request{interrupt}
 //   /compact   -> injected as a user-turn (/compact)   [caller-supplied injectUser]
 import { randomUUID } from 'node:crypto';
@@ -15,11 +15,27 @@ function fmtContext(r) {
     .map(c => `• ${c.name}: ${fmtK(c.tokens)}`).join('\n');
   return cats ? head + '\n' + cats : head;
 }
+function fmtReset(iso) {
+  try {
+    const d = new Date(iso), now = new Date();
+    const hh = String(d.getHours()).padStart(2, '0'), mm = String(d.getMinutes()).padStart(2, '0');
+    return d.toDateString() === now.toDateString()
+      ? `${hh}:${mm}`
+      : `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')} ${hh}:${mm}`;
+  } catch { return ''; }
+}
+// get_usage.response.rate_limits: { five_hour:{utilization(0-100), resets_at}, seven_day:{…}, seven_day_sonnet:{…} }
+function fmtUsage(r) {
+  const rl = r.rate_limits;
+  if (!r.rate_limits_available || !rl) return '⏳ лимиты пока недоступны';
+  const row = (label, x) => (x && x.utilization != null) ? `${label}: ${x.utilization}%${x.resets_at ? ` (сброс ${fmtReset(x.resets_at)})` : ''}` : null;
+  const lines = [row('⏳ 5ч', rl.five_hour), row('📅 неделя', rl.seven_day), row('📅 неделя·Sonnet', rl.seven_day_sonnet)].filter(Boolean);
+  return lines.length ? lines.join('\n') : '⏳ лимиты пока недоступны';
+}
 
 // deps: { toEngine(obj), sendHub(obj), sessionId (string | () => string), owner, injectUser(text) }
 export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser }) {
   const pending = new Map(); // myRequestId -> { kind, chat_id, timer }
-  let lastRate = null;       // last five_hour rate_limit_info
 
   const sid = () => (typeof sessionId === 'function' ? sessionId() : sessionId); // may be late-bound (interposer)
   const replyTo = (chat_id, text) => sendHub({ t: 'reply', sessionId: sid(), chat_id: chat_id || owner, text });
@@ -29,20 +45,13 @@ export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser
     pending.set(request_id, { kind, chat_id, timer });
     toEngine({ type: 'control_request', request_id, request: { subtype, ...(extra || {}) } });
   }
-  function fmtLimits() {
-    if (!lastRate) return '⏳ 5ч-лимит ещё неизвестен (придёт после первого ответа модели)';
-    const pct = Math.round((lastRate.utilization || 0) * 100);
-    let when = '';
-    if (lastRate.resetsAt) { try { const d = new Date(lastRate.resetsAt * 1000); when = `, сброс ~${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; } catch {} }
-    return `⏳ 5ч-лимит: ${pct}% (${lastRate.status || 'allowed'})${when}`;
-  }
 
   return {
     handle(name, chat_id) {
       switch (name) {
         case 'context': return issue('get_context_usage', {}, 'context', chat_id);
         case 'rc': case 'remote_control': return issue('remote_control', { enabled: true }, 'rc', chat_id);
-        case 'limits': return replyTo(chat_id, fmtLimits());
+        case 'limits': return issue('get_usage', {}, 'usage', chat_id);
         case 'interrupt': toEngine({ type: 'control_request', request_id: 'tg_int_' + randomUUID().slice(0, 8), request: { subtype: 'interrupt' } }); return replyTo(chat_id, '⏹ Прервано');
         case 'compact': injectUser('/compact'); return replyTo(chat_id, '🗜 Запустил /compact…');
         default: return replyTo(chat_id, `неизвестная команда: ${name}`);
@@ -58,8 +67,8 @@ export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser
       const r = o.response?.response || {};
       if (pc.kind === 'context') replyTo(pc.chat_id, fmtContext(r));
       else if (pc.kind === 'rc') replyTo(pc.chat_id, r.session_url ? `🌐 Remote control:\n${r.session_url}\n\nОткрой ссылку на телефоне / в claude.ai, чтобы продолжить сессию.` : '⚠️ не удалось включить remote-control');
+      else if (pc.kind === 'usage') replyTo(pc.chat_id, fmtUsage(r));
       return true;
     },
-    noteRateLimit(info) { if (info && (info.rateLimitType || 'five_hour') === 'five_hour') lastRate = info; },
   };
 }

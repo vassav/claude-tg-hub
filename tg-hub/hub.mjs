@@ -91,11 +91,21 @@ function conversationFile(id) {
 function conversationExists(id) { return !!conversationFile(id); }
 // A conversation whose .jsonl was just written is almost certainly live — don't resume it.
 function jsonlFresh(id) { const f = conversationFile(id); if (!f) return false; try { return Date.now() - statSync(f).mtimeMs < ACTIVE_WINDOW_MS; } catch { return false; } }
-// A live NON-managed session in the same cwd may BE this conversation (we don't know
-// its real UUID) — refuse to resume into it to avoid a co-writer on one .jsonl.
+// Co-writer guard: refuse to resume conversation `id` only if a live session in the
+// same cwd whose REAL conversation UUID we DON'T know might actually be `id` (would
+// double-write one .jsonl). We skip live sessions we can identify: managed ones (we
+// forced their UUID) and any whose id maps to a real <id>.jsonl (panels/headless
+// register with their real conversation UUID) — those write a DISTINCT file (lid≠id).
+// Only an unidentifiable id (e.g. a plugin channels shim's synthetic basename-pid id,
+// with no <id>.jsonl) is ambiguous → block.
 function liveCwdConflict(id, cwd) {
   if (!cwd) return false;
-  for (const lid of sessions.keys()) { if (lid === id) continue; if (!registry.get(lid)?.managed && sessions.get(lid)?.cwd === cwd) return true; }
+  for (const lid of sessions.keys()) {
+    if (lid === id) continue;
+    if (registry.get(lid)?.managed) continue;   // forced UUID → writes its own .jsonl
+    if (conversationExists(lid)) continue;       // id is a real conversation UUID → distinct .jsonl
+    if (sessions.get(lid)?.cwd === cwd) return true; // unidentifiable id in this cwd → can't rule out a co-writer
+  }
   return false;
 }
 // Decide a non-live managed entry's fate. NEVER mark dead while it looks alive (own
@@ -239,18 +249,21 @@ async function sendTg(chatId, text, sid, extra = {}) {
 function replyKeyboard() {
   const k = new Keyboard();
   if (order.length) { for (const id of order) k.text(labelOf(id) + (id === active ? ' ✓' : '')); k.row(); }
-  k.text('/sessions').text('/projects');
+  k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
 }
 // stream-json sessions (VSCode panel, or hub-launched headless) are control-capable:
 // they accept /context, /rc, /limits, /compact, /interrupt. Channels CLI sessions are not.
 const isStream = id => sessions.get(id)?.kind === 'stream';
+// Inline command pad for ONE stream session, opened via the ⚙ пульт keyboard button.
+function controlPad(id) {
+  return new InlineKeyboard()
+    .text('🧮 контекст', `cmd:${id}:context`).text('🌐 remote', `cmd:${id}:rc`).row()
+    .text('⏳ лимит', `cmd:${id}:limits`).text('🗜 compact', `cmd:${id}:compact`).text('⏹ прервать', `cmd:${id}:interrupt`).row();
+}
 function sessionInline() {
   const k = new InlineKeyboard();
-  for (const id of order) {
-    k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row();
-    if (isStream(id)) k.text('🧮 ctx', `cmd:${id}:context`).text('🌐 rc', `cmd:${id}:rc`).text('⏳ lim', `cmd:${id}:limits`).text('🗜', `cmd:${id}:compact`).text('⏹', `cmd:${id}:interrupt`).row();
-  }
+  for (const id of order) { k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
   return k;
 }
@@ -661,6 +674,15 @@ bot.on('callback_query:data', async ctx => {
 bot.on('message:text', async ctx => {
   if (!owns(ctx)) return;
   const text = ctx.message.text;
+
+  // ⚙ пульт keyboard button -> open the inline command pad for the active stream session
+  if (text === '⚙ пульт') {
+    const id = active;
+    if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
+    if (!isStream(id)) { await ctx.reply('⚙️ пульт доступен только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
+    await ctx.reply(`⚙ пульт · ${labelOf(id)}`, { reply_markup: controlPad(id) });
+    return;
+  }
 
   const rid = ctx.message.reply_to_message?.message_id;
   if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), text); return; }

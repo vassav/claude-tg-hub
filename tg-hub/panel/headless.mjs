@@ -128,8 +128,6 @@ function onEngine(o) {
   }
   // tool approval request -> Telegram buttons
   if (o.type === 'control_request' && o.request?.subtype === 'can_use_tool') { offerApproval(o.request, o.request_id); return; }
-  // passive 5-hour rate limit
-  if (o.type === 'rate_limit_event') { cmds.noteRateLimit(o.rate_limit_info); return; }
   // mirror assistant text
   if (o.type === 'assistant' && o.message?.content) {
     const to = boundChatId || OWNER;
@@ -140,7 +138,14 @@ function onEngine(o) {
 
 // ── spawn + wire ──────────────────────────────────────────────────────────────
 log('===== HEADLESS START =====', { exe, rest, HUB_PORT, SESSION_ID });
-const child = spawn(exe, rest, { stdio: ['pipe', 'pipe', 'inherit'], cwd });
+// Strip hub-coordination env from the CLAUDE child: if the hub channel PLUGIN is
+// globally enabled, its shim.mjs would otherwise inherit SESSION_ID/HUB_* and
+// self-join the hub (a second, kind-less registration that fights ours and disrupts
+// the turn). We are the only bridge — keep that shim passive. (We already captured
+// these values into module consts above.)
+const childEnv = { ...process.env };
+for (const k of ['SESSION_ID', 'HUB_PORT', 'HUB_TOKEN', 'HUB_JOIN', 'HUB_BOT_TOKEN']) delete childEnv[k];
+const child = spawn(exe, rest, { stdio: ['pipe', 'pipe', 'inherit'], cwd, env: childEnv });
 
 // startup handshake: empty hooks so the engine never fires hook_callback (which we
 // have no UI to answer); default permission mode (tools still gated via can_use_tool).

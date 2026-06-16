@@ -225,8 +225,6 @@ function onOut(o) {                                   // engine -> extension
   // our own control-command responses (/context, /rc) — formatted + sent to Telegram,
   // and DROPped so the extension never sees a response it didn't request.
   if (o.type === 'control_response' && cmds.onControlResponse(o)) return DROP;
-  // passive 5-hour rate limit (forwarded to the panel as usual)
-  if (o.type === 'rate_limit_event') { cmds.noteRateLimit(o.rate_limit_info); return; }
   // engine-generated session title -> name the hub session
   if (o.type === 'control_response' && o.response?.response?.title) {
     sendHub({ t: 'title', sessionId, title: String(o.response.response.title).slice(0, 60) });
