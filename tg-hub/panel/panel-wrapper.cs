@@ -14,7 +14,7 @@ using System.Text;
 // through unchanged. We always inherit stdio so the extension<->claude pipes bridge.
 public class PanelWrapper {
     const string NodeExe = @"C:\Program Files\nodejs\node.exe";
-    const string Interposer = @"D:\Projects\vassav\claude-tg-hub\hub-demo\panel\interposer.mjs";
+    const string Interposer = @"D:\Projects\vassav\claude-tg-hub\tg-hub\panel\interposer.mjs";
 
     static string Quote(string s) {
         if (s.Length > 0 && s.IndexOfAny(new char[] { ' ', '\t', '\n', '\v', '"' }) < 0) return s;

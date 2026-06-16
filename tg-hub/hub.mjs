@@ -156,13 +156,13 @@ function makeLabel(cwd, exceptId) { return uniqueLabel(folderBase(cwd), exceptId
 // overrides an existing name. Renames in place — silent (shows on next render).
 function applyName(id, raw, fromModel) {
   const e = registry.get(id);
-  if (!e) return;
-  if (e.named && !fromModel) return;
-  const label = uniqueLabel(slugLabel(raw) || folderBase(e.cwd), id);
-  e.label = label; e.named = true;
-  const live = sessions.get(id); if (live) live.label = label;
+  const live = sessions.get(id);
+  if (!e && !live) return;                          // unknown session
+  if (e?.named && !fromModel) return;               // slug fallback never overrides an existing name
+  const label = uniqueLabel(slugLabel(raw) || folderBase(e?.cwd || live?.cwd), id);
+  if (e) { e.label = label; e.named = true; saveRegistry(); }
+  if (live) live.label = label;                     // also rename non-managed (panel) live sessions
   awaitingTitle.delete(id);
-  saveRegistry();
 }
 // On the first request to an unnamed managed session, wait for the model's
 // set_title; if it doesn't arrive in time, fall back to slugging that request.
@@ -331,6 +331,14 @@ function readMeta(file) {
   } catch {}
   return { cwd, title };
 }
+// Locate a conversation transcript by session id (scan the projects dirs) and read
+// its stored title — used to name a session that registers without a hub-known name
+// (e.g. a VSCode panel resuming an existing conversation).
+function findSessionFile(sid) {
+  try { for (const dir of readdirSync(PROJECTS_DIR)) { const f = join(PROJECTS_DIR, dir, sid + '.jsonl'); if (existsSync(f)) return f; } } catch {}
+  return null;
+}
+function diskTitle(sid) { const f = findSessionFile(sid); return f ? (readMeta(f).title || '') : ''; }
 function listProjects() {
   let dirs = [];
   try { dirs = readdirSync(PROJECTS_DIR); } catch { return []; }
@@ -418,10 +426,14 @@ net.createServer(sock => {
             pid: m.ppid || known?.pid || null, bootId: BOOT_ID,
           });
         }
+        // A session that registers without a hub-known name (e.g. a VSCode panel
+        // resuming an existing conversation) — pull its stored title from disk so it
+        // shows its real name instead of just the cwd folder.
+        if (!known?.named) { const dt = diskTitle(sid); if (dt) applyName(sid, dt, true); }
         if (pendingActivate.has(sid)) { active = sid; pendingActivate.delete(sid); }
         else if (!active) active = sid;
-        console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${label} = ${sid} (cwd ${m.cwd})`);
-        notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${label}\ncwd: ${m.cwd}\nactive: ${labelOf(active)}`, { reply_markup: replyKeyboard() });
+        console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${labelOf(sid)} = ${sid} (cwd ${m.cwd})`);
+        notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${labelOf(sid)}\ncwd: ${m.cwd}\nactive: ${labelOf(active)}`, { reply_markup: replyKeyboard() });
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {

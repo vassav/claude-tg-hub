@@ -62,7 +62,7 @@ stdio-пайпами):
 кнопки аппрува именно для панели.
 
 ## Архитектура моста
-`hub-demo/panel/interposer.mjs` = «shim панели»: прозрачно форвардит данные в обе стороны
+`tg-hub/panel/interposer.mjs` = «shim панели»: прозрачно форвардит данные в обе стороны
 И подключается к хабу тем же IPC, что обычный shim (`register/reply/title/permission_request`
 ↔ `inbound/permission_decision/stop`). Идентичность сессии — `session_id` движка (UUID,
 отличает её от CLI-shim, у которого `<папка>-<pid>`). Регистрируется как **не-managed** — хаб
@@ -88,7 +88,7 @@ stdio-пайпами):
 разбивка сообщений >4096.
 
 ## Установка
-1. Поправь пути в [`hub-demo/panel/panel-wrapper.cs`](../../hub-demo/panel/panel-wrapper.cs)
+1. Поправь пути в [`tg-hub/panel/panel-wrapper.cs`](../../tg-hub/panel/panel-wrapper.cs)
    (`NodeExe`, `Interposer`) под свою машину.
 2. Скомпилируй `.cs` в консольный `.exe` (например, в PowerShell):
    ```powershell

@@ -1,9 +1,9 @@
 {
-  "name": "claude-tg-hub-demo",
+  "name": "claude-tg-hub",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Demo: one Telegram bot routing to N Claude CLI sessions via native channels.",
+  "description": "One Telegram bot routing to N Claude Code sessions (CLI + VSCode panel) via native channels.",
   "scripts": {
     "hub": "node hub.mjs",
     "launch": "node launch.mjs"

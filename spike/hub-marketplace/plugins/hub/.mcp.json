@@ -2,7 +2,7 @@
   "mcpServers": {
     "hub": {
       "command": "node",
-      "args": ["D:\\Projects\\vassav\\claude-tg-hub\\hub-demo\\shim.mjs"]
+      "args": ["D:\\Projects\\vassav\\claude-tg-hub\\tg-hub\\shim.mjs"]
     }
   }
 }

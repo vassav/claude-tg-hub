@@ -49,14 +49,14 @@ Telegram (1 бот) ─ getUpdates ─ HUB (демон): бот + IPC-серве
                                   claude  (CLI-сессия)
 ```
 
-- **`hub-demo/hub.mjs`** — демон: владеет ботом (grammY, единственный поллер), TCP-IPC, реестром
+- **`tg-hub/hub.mjs`** — демон: владеет ботом (grammY, единственный поллер), TCP-IPC, реестром
   сессий, маршрутизацией (команда / reply-to / клавиатура ↔ сессия), аппрув-кнопками, историей
   проектов + resume, созданием и остановкой сессий.
-- **`hub-demo/shim.mjs`** — per-session channel-MCP-сервер (без зависимостей): объявляет
+- **`tg-hub/shim.mjs`** — per-session channel-MCP-сервер (без зависимостей): объявляет
   `claude/channel` + `claude/channel/permission`, релеит вход / аппрувы / `reply`, сам находит
   хаб (discovery-конфиг) и присваивает себе id; останавливает свою сессию, убивая родителя-`claude`.
-- **`hub-demo/session.mjs`** — запуск сессии в PTY (node-pty, с авто-подтверждением стартовых
-  промптов); **`hub-demo/launch.mjs`** — поднять стартовые сессии.
+- **`tg-hub/session.mjs`** — запуск сессии в PTY (node-pty, с авто-подтверждением стартовых
+  промптов); **`tg-hub/launch.mjs`** — поднять стартовые сессии.
 
 ## Команды бота
 
@@ -82,7 +82,7 @@ Telegram (1 бот) ─ getUpdates ─ HUB (демон): бот + IPC-серве
 
 ### Требования
 
-- **Node.js ≥ 22.** `hub-demo` тянет нативную зависимость `node-pty` — обычно ставится
+- **Node.js ≥ 22.** `tg-hub` тянет нативную зависимость `node-pty` — обычно ставится
   из prebuilt-бинаря; если для твоей версии Node его нет, понадобится тулчейн сборки
   (на Windows — «Desktop development with C++» из Visual Studio Build Tools + Python 3;
   на Linux/macOS — `build-essential`/Xcode CLT).
@@ -98,7 +98,7 @@ Telegram (1 бот) ─ getUpdates ─ HUB (демон): бот + IPC-серве
 1. **Клонировать и поставить зависимости:**
    ```bash
    git clone https://github.com/vassav/claude-tg-hub.git
-   cd claude-tg-hub/hub-demo
+   cd claude-tg-hub/tg-hub
    npm install
    ```
 
@@ -111,19 +111,19 @@ Telegram (1 бот) ─ getUpdates ─ HUB (демон): бот + IPC-серве
    # CLAUDE_BIN=C:\path\to\claude.exe       # см. шаг 3
    ```
 
-3. **Указать путь к `claude` (если он не дефолтный).** [`session.mjs`](hub-demo/session.mjs)
+3. **Указать путь к `claude` (если он не дефолтный).** [`session.mjs`](tg-hub/session.mjs)
    по умолчанию ищет `claude.exe` по моему пути установки. На своей машине задай
    переменную `CLAUDE_BIN` (в `.env` или в окружении) на свой бинарь:
    - Windows: `where.exe claude` → возьми путь к `…\bin\claude.exe`;
    - Linux/macOS: `which claude`.
 
 4. **Поправить рабочий каталог сессий.** Сейчас путь захардкожен под мою машину —
-   замени `TMP` в [`hub.mjs`](hub-demo/hub.mjs#L28) и [`launch.mjs`](hub-demo/launch.mjs#L20)
+   замени `TMP` в [`hub.mjs`](tg-hub/hub.mjs#L28) и [`launch.mjs`](tg-hub/launch.mjs#L20)
    на свою папку (например, `%LOCALAPPDATA%\Temp\hubsessions` или `/tmp/hubsessions`).
    *(Это временные cwd для тестовых сессий `launch.mjs`; для реальной работы создавай
    сессии в нужных проектах через `/new <путь>` или `/projects`.)*
 
-5. **Запуск** (два терминала из `hub-demo`):
+5. **Запуск** (два терминала из `tg-hub`):
    ```bash
    npm run hub       # терминал 1 — демон-бот (один поллер Telegram + IPC + реестр)
    npm run launch    # терминал 2 — опционально: поднять тестовые сессии sess-A/sess-B
@@ -162,7 +162,7 @@ shim сам найдёт хаб и зарегистрирует сессию; `H
 channels, не авто-аппрувится). Пока сессия привязана к Telegram, запрос аппрува перехватывается и
 в панель не отдаётся — её диалог не зависает.
 
-Код — в [`hub-demo/panel/`](hub-demo/panel/) (`interposer.mjs` + `panel-wrapper.cs`). Сборка
+Код — в [`tg-hub/panel/`](tg-hub/panel/) (`interposer.mjs` + `panel-wrapper.cs`). Сборка
 wrapper'а, настройка и проверенный stream-json — в спеке
 [`docs/specs/2026-06-11-vscode-panel-bridge.md`](docs/specs/2026-06-11-vscode-panel-bridge.md).
 
@@ -195,8 +195,8 @@ wrapper'а, настройка и проверенный stream-json — в сп
 
 | Папка | |
 |---|---|
-| `hub-demo/` | ядро инструмента: `hub.mjs` (демон), `shim.mjs`, `session.mjs`, `launch.mjs` *(имя папки — историческое)* |
-| `hub-demo/panel/` | мост с панелью VSCode: `interposer.mjs` (stdio-интерпозер ↔ хаб), `panel-wrapper.cs` (wrapper, компилируется в `.exe`) |
+| `tg-hub/` | ядро инструмента: `hub.mjs` (демон), `shim.mjs`, `session.mjs`, `launch.mjs` *(имя папки — историческое)* |
+| `tg-hub/panel/` | мост с панелью VSCode: `interposer.mjs` (stdio-интерпозер ↔ хаб), `panel-wrapper.cs` (wrapper, компилируется в `.exe`) |
 | `spike/channel-server/` | спайк channel-сервера + PTY-тесты (валидация протокола) |
 | `spike/hub-marketplace/` | канал, упакованный плагином (`hub`) + локальный marketplace |
 | `spike/managed-settings/` | helper для `allowedChannelPlugins` |

@@ -1,4 +1,4 @@
-# hub-demo — один Telegram-бот → N Claude-сессий через нативные channels
+# tg-hub — один Telegram-бот → N Claude-сессий через нативные channels
 
 Демо мультисессийного хаба (валидирует дизайн из `docs/specs/2026-06-06-...`).
 
@@ -20,7 +20,7 @@ HUB_TOKEN=...          # секрет shim↔hub
 
 ## Запуск
 ```powershell
-cd hub-demo
+cd tg-hub
 npm install
 # терминал 1: демон-бот
 node hub.mjs
