@@ -30,6 +30,11 @@ dotenv.config({ path: join(ROOT, '.env') });
 
 const TOKEN = process.env.HUB_BOT_TOKEN;
 const OWNER = String(process.env.HUB_OWNER_ID || '');
+// The bot's "home" chat: where ALL bot-originated output goes (session-reply
+// fallback, approvals, notifications) and which is accepted as input. Defaults to
+// the owner's DM; set HUB_CHAT_ID to a group's id (e.g. -1001234567890) to run the
+// whole bot in that group — output lands there and any group member may drive it.
+const CHAT = String(process.env.HUB_CHAT_ID || OWNER);
 const PORT = Number(process.env.HUB_PORT || 8799);
 const IPC_TOKEN = process.env.HUB_TOKEN || 'dev';
 const SHIM = join(HERE, 'shim.mjs');
@@ -58,7 +63,7 @@ const bot = new Bot(TOKEN);
 const sessions = new Map();    // sessionId -> { conn, cwd, label }  (LIVE only — has a socket)
 const order = [];
 const pendingPerm = new Map(); // request_id -> sessionId
-const permMsg = new Map();      // request_id -> approval-card message_id (OWNER chat), for clearing buttons
+const permMsg = new Map();      // request_id -> approval-card message_id (home chat), for clearing buttons
 const outMsgToSession = new Map();
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
@@ -190,7 +195,7 @@ function armAutoName(id, body) {
     applyName(id, text, false);
   }, TITLE_TIMEOUT_MS);
 }
-const notify = (text, extra) => bot.api.sendMessage(OWNER, text, extra).catch(() => {});
+const notify = (text, extra) => bot.api.sendMessage(CHAT, text, extra).catch(() => {});
 function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.conn.write(JSON.stringify(obj) + '\n'); return true; } return false; }
 
 // ── Telegram rendering ───────────────────────────────────────────────────────
@@ -462,18 +467,18 @@ net.createServer(sock => {
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
-        sendTg(m.chat_id || OWNER, `[${labelOf(m.sessionId)}] ${m.text}`, m.sessionId);
+        sendTg(m.chat_id || CHAT, `[${labelOf(m.sessionId)}] ${m.text}`, m.sessionId);
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
         const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (m.input_preview ? `\n${m.input_preview}` : '');
-        sendTg(OWNER, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+        sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
       } else if (m.t === 'approval_cancel') {
         // The session answered this approval elsewhere (e.g. in the VSCode panel) —
         // drop the now-stale Telegram buttons.
         pendingPerm.delete(m.request_id);
         const mid = permMsg.get(m.request_id); permMsg.delete(m.request_id);
-        if (mid) bot.api.editMessageText(OWNER, mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
+        if (mid) bot.api.editMessageText(CHAT, mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
       } else if (m.t === 'inject') {
         // External, programmatic inbound (a local consumer process, NOT a human in
         // Telegram). Authenticated like register; target is a live session's id or
@@ -482,7 +487,7 @@ net.createServer(sock => {
         if (m.token !== IPC_TOKEN) { sock.end(); return; }
         const id = order.find(x => x === m.target || labelOf(x) === m.target);
         const meta = { ...(m.meta || {}) };
-        if (!meta.chat_id) meta.chat_id = OWNER; // replies default to the owner's chat
+        if (!meta.chat_id) meta.chat_id = CHAT; // replies default to the bot's home chat (DM or group)
         if (id && sendToSession(id, { t: 'inbound', content: m.content, meta })) {
           armAutoName(id, m.content);
           sock.write(JSON.stringify({ ok: true }) + '\n');
@@ -509,9 +514,15 @@ net.createServer(sock => {
 }).listen(PORT, '127.0.0.1', () => console.error(`[hub] IPC on 127.0.0.1:${PORT}`));
 
 // ── Telegram ─────────────────────────────────────────────────────────────────
-const owns = ctx => String(ctx.from?.id) === OWNER;
+// Access gate: the owner (in any chat) OR anyone writing in the bot's home chat —
+// so a configured HUB_CHAT_ID group works for its members. When HUB_CHAT_ID is
+// unset, CHAT===OWNER, so this stays owner-only (identical to before).
+const owns = ctx => String(ctx.from?.id) === OWNER || String(ctx.chat?.id) === CHAT;
 
 bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard() }); });
+
+// Discover a chat's id (run it in a group to get the negative id for HUB_CHAT_ID).
+bot.command('id', async ctx => { if (!owns(ctx)) return; await ctx.reply(`chat_id: ${ctx.chat.id}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`); });
 
 bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
@@ -704,4 +715,4 @@ bot.catch(err => console.error('[hub] bot error', err?.error));
 // Don't let a node-pty/conpty quirk (e.g. AttachConsole on a dead pty) crash the daemon.
 process.on('uncaughtException', e => console.error('[hub] uncaught:', e?.message || e));
 process.on('unhandledRejection', e => console.error('[hub] unhandledRejection:', e?.message || e));
-bot.start({ onStart: i => console.error(`[hub] polling as @${i.username}; owner=${OWNER}`) });
+bot.start({ onStart: i => console.error(`[hub] polling as @${i.username}; owner=${OWNER}; home chat=${CHAT}${CHAT !== OWNER ? ' (group)' : ' (owner DM)'}`) });
