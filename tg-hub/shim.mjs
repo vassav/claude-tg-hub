@@ -49,6 +49,23 @@ function connectHub() {
   hub.on('close', () => { hubReady = false; log('hub closed; retry 2s'); setTimeout(connectHub, 2000); });
 }
 function sendHub(m) { if (!JOIN) return; if (hubReady && hub) hub.write(JSON.stringify(m) + '\n'); else queue.push(m); }
+// Standalone Telegram notification to the hub's home chat. Unlike sendHub (gated by
+// JOIN, rides the persistent channel link), this opens a ONE-SHOT TCP to the hub —
+// so it works even from a session that merely has the plugin loaded but hasn't
+// joined the hub. The hub's {t:'notify'} branch delivers it via its single bot.
+function notifyHub(text, chat_id) {
+  return new Promise(resolve => {
+    const sock = net.connect({ host: '127.0.0.1', port: HUB_PORT });
+    let buf = '', done = false;
+    const fin = v => { if (done) return; done = true; try { sock.destroy(); } catch {} resolve(v); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => sock.write(JSON.stringify({ t: 'notify', token: HUB_TOKEN, text, ...(chat_id ? { chat_id } : {}) }) + '\n'));
+    sock.on('data', d => { buf += d; const i = buf.indexOf('\n'); if (i >= 0) { let r; try { r = JSON.parse(buf.slice(0, i)); } catch {} fin(r || { ok: false, error: 'bad response' }); } });
+    sock.on('error', e => fin({ ok: false, error: 'hub not reachable: ' + (e.code || e.message) }));
+    sock.on('close', () => fin({ ok: false, error: 'hub closed (token?)' }));
+    setTimeout(() => fin({ ok: false, error: 'timeout (is the hub running?)' }), 5000);
+  });
+}
 function onHub(m) {
   log('HUB->', m);
   if (m.t === 'inbound') toEngine({ jsonrpc: '2.0', method: 'notifications/claude/channel', params: { content: m.content, meta: m.meta || {} } });
@@ -100,6 +117,10 @@ function handle(msg) {
       name: 'set_title',
       description: 'Name this session with a short title (≤40 chars) summarizing what it is about. Call once after the first user message; not shown in chat.',
       inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
+    }, {
+      name: 'notify',
+      description: 'Send a standalone notification to the user on Telegram via the hub. Unlike `reply` (which answers an inbound <channel> message and needs its chat_id), `notify` needs no chat_id and works even if this session is NOT attached to the hub — use it to ping the user when a long task finishes or needs their attention.',
+      inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'Message text; Markdown is rendered.' }, chat_id: { type: 'string', description: 'Optional target chat; defaults to the hub home chat.' } }, required: ['text'] },
     }] }});
     return;
   }
@@ -113,6 +134,16 @@ function handle(msg) {
     if (params?.name === 'set_title') {
       sendHub({ t: 'title', sessionId: SESSION_ID, title: String(a.title ?? '') });
       toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JOIN ? 'session named' : 'hub not joined' }] } });
+      return;
+    }
+    if (params?.name === 'notify') {
+      const text = String(a.text ?? '').trim();
+      if (!text) { toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'text is required' }], isError: true } }); return; }
+      notifyHub(text, a.chat_id ? String(a.chat_id) : undefined).then(r => {
+        toEngine({ jsonrpc: '2.0', id, result: (r && r.ok)
+          ? { content: [{ type: 'text', text: 'sent to Telegram' }] }
+          : { content: [{ type: 'text', text: 'failed: ' + (r?.error || 'unknown') }], isError: true } });
+      });
       return;
     }
     toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `unknown tool: ${params?.name}` }], isError: true } });

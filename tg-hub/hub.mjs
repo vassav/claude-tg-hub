@@ -518,6 +518,16 @@ net.createServer(sock => {
           pendingFirstMsg.set(newId, { content: String(m.content), meta });
         }
         sock.write(JSON.stringify({ ok: true, id: newId }) + '\n');
+      } else if (m.t === 'notify') {
+        // Standalone Telegram notification from ANY local client — e.g. the hub
+        // plugin's `notify` tool (shim.mjs), callable even from a session NOT joined
+        // to the hub. No session, no [label] prefix — just deliver text to the home
+        // chat (or an explicit chat_id).
+        if (m.token !== IPC_TOKEN) { sock.end(); return; }
+        const text = String(m.text ?? '').trim();
+        if (!text) { sock.write(JSON.stringify({ ok: false, error: 'empty text' }) + '\n'); return; }
+        sendTg(m.chat_id || CHAT, text);
+        sock.write(JSON.stringify({ ok: true }) + '\n');
       }
     }
   });
