@@ -473,7 +473,7 @@ net.createServer(sock => {
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
-        sendTg(m.chat_id || CHAT, `[${labelOf(m.sessionId)}] ${m.text}`, m.sessionId);
+        sendTg(m.chat_id || CHAT, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId);
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
