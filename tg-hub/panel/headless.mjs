@@ -63,7 +63,7 @@ function onHub(m) {
     boundChatId = String(m.meta?.chat_id || boundChatId || OWNER || '');
     injectUser(String(m.content ?? ''));
   } else if (m.t === 'permission_decision') {
-    resolveApproval(m.request_id, m.behavior, m.answers, m.message);
+    resolveApproval(m.request_id, m.behavior, m.answers, m.message, m.suggestion);
   } else if (m.t === 'command') {
     cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || OWNER || ''));
   } else if (m.t === 'stop') {
@@ -99,25 +99,32 @@ function toolPreview(tool, input) {
 }
 function offerApproval(req, request_id) {
   const synthId = newSynthId();
-  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false });
+  // Keep the engine's permission_suggestions verbatim — the hub only ever names them
+  // and sends back an INDEX, so what we hand the engine stays byte-identical to what
+  // it offered (e.g. Edit -> {setMode:'acceptEdits', destination:'session'}).
+  const sug = Array.isArray(req.permission_suggestions) ? req.permission_suggestions : [];
+  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false, suggestions: sug });
   synthToReal.set(synthId, request_id);
   const tool = req.tool_name || req.display_name || 'tool';
   const ask = askOf(tool, req.input);   // AskUserQuestion -> real option buttons instead of Allow/Deny
-  sendHub({ t: 'permission_request', sessionId: SESSION_ID, request_id: synthId, tool_name: tool, description: req.description || '', input_preview: toolPreview(tool, req.input), ...(ask ? { ask } : {}) });
-  log('approval -> hub', { synthId, tool, request_id, ask: !!ask });
+  sendHub({ t: 'permission_request', sessionId: SESSION_ID, request_id: synthId, tool_name: tool, description: req.description || '', input_preview: toolPreview(tool, req.input), ...(ask ? { ask } : {}), ...(sug.length && !ask ? { suggestions: sug } : {}) });
+  log('approval -> hub', { synthId, tool, request_id, ask: !!ask, suggestions: sug.length });
 }
-function resolveApproval(synthId, behavior, picks, denyMsg) {
+function resolveApproval(synthId, behavior, picks, denyMsg, sugIdx) {
   const realId = synthToReal.get(synthId);
   if (!realId) return;
   const a = approvals.get(realId);
   if (!a || a.resolved) return;
   a.resolved = true;
+  const sug = sugIdx == null ? null : a.suggestions?.[sugIdx];   // index -> the ORIGINAL suggestion object
   const response = behavior === 'allow'
     // picks -> answers on the ORIGINAL input (exact question/label text); no picks -> input untouched
-    ? { behavior: 'allow', updatedInput: picks ? buildAnswers(a.input, picks) : a.input, updatedPermissions: [], toolUseID: a.toolUseId }
+    ? { behavior: 'allow', updatedInput: picks ? buildAnswers(a.input, picks) : a.input,
+        updatedPermissions: sug ? [sug] : [], toolUseID: a.toolUseId,
+        ...(sug ? { decisionClassification: sug.destination === 'session' ? 'user_temporary' : 'user_permanent' } : {}) }
     : { behavior: 'deny', message: String(denyMsg || 'Denied via Telegram') };   // message is mandatory
   toEngine({ type: 'control_response', response: { subtype: 'success', request_id: realId, response } });
-  log('INJECT verdict', { realId, behavior, answered: !!picks });
+  log('INJECT verdict', { realId, behavior, answered: !!picks, suggestion: sug || null });
 }
 
 // ── engine output handler ─────────────────────────────────────────────────────

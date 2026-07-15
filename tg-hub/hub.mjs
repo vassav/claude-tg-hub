@@ -301,6 +301,24 @@ function askCard(rid) {
   kb.text('❌ Отмена', `ask:${rid}:x`).row();
   return { text, kb };
 }
+// The engine ships ready-made permission_suggestions with each approval (Edit ->
+// {setMode:'acceptEdits', destination:'session'}, i.e. "stop asking me this session").
+// We only NAME them; the chosen one goes back as an index and the client replays the
+// engine's own object, so granularity (Bash command prefixes, paths) stays the engine's.
+const MODE_RU = { acceptEdits: 'принимать правки', bypassPermissions: 'без запросов', plan: 'режим плана', default: 'обычный режим' };
+const DEST_RU = { session: 'до конца сессии', localSettings: 'навсегда (локально)', projectSettings: 'навсегда (проект)', userSettings: 'навсегда (глобально)', cliArg: '' };
+function suggestLabel(s) {
+  const dest = DEST_RU[s?.destination] ?? s?.destination ?? '';
+  const tail = dest ? ` — ${dest}` : '';
+  if (s?.type === 'setMode') return `✅ ${MODE_RU[s.mode] || s.mode}${tail}`;
+  if (s?.type === 'addRules' || s?.type === 'replaceRules') {
+    const r = s.rules?.[0];
+    const what = r ? (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName) : 'правило';
+    return `${s.behavior === 'deny' ? '⛔ запретить' : '✅ разрешить'} ${what}${tail}`;
+  }
+  if (s?.type === 'addDirectories') return `📁 + ${(s.directories || []).join(', ')}${tail}`;
+  return `${s?.type || 'правило'}${tail}`;
+}
 function askSummary(st) {
   return `✅ [${labelOf(st.sessionId)}] ответ отправлен\n` + st.qs.questions.map((q, qi) =>
     `• ${q.header || q.question}: **${st.picks[qi].map(i => q.options[i].label).join(', ') || '—'}**`).join('\n');
@@ -531,7 +549,9 @@ net.createServer(sock => {
           const c = askCard(m.request_id);
           sendTg(CHAT, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
         } else {                                       // channels (or any other tool): Allow/Deny as before
-          const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
+          const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`).row();
+          // …plus the engine's own "don't ask again" offers (stream sessions only)
+          (m.suggestions || []).slice(0, 4).forEach((s, i) => kb.text(btnLabel(suggestLabel(s)), `psug:${m.request_id}:${i}`).row());
           const pv = (m.input_preview && askDigest(m.tool_name, m.input_preview)) || m.input_preview;
           const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (pv ? `\n${pv}` : '');
           sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
@@ -715,6 +735,19 @@ bot.on('callback_query:data', async ctx => {
     permMsg.delete(rid);
     await ctx.answerCallbackQuery({ text: behavior === 'allow' ? 'Allowed' : 'Denied' }).catch(() => {});
     await ctx.editMessageText(`${ctx.callbackQuery.message?.text || ''}\n\n${behavior === 'allow' ? '✅ Allowed' : '❌ Denied'}`).catch(() => {});
+    return;
+  }
+
+  // "Don't ask again" — allow this call AND apply the engine's suggestion #i. Only the
+  // index travels; the session replays the engine's own suggestion object verbatim.
+  if ((m = /^psug:([a-z]{5}):([0-3])$/.exec(data))) {
+    const [, rid, i] = m;
+    const s = pendingPerm.get(rid);
+    if (!s) { await ctx.answerCallbackQuery({ text: 'expired' }).catch(() => {}); return; }
+    sendToSession(s, { t: 'permission_decision', request_id: rid, behavior: 'allow', suggestion: Number(i) });
+    pendingPerm.delete(rid); permMsg.delete(rid);
+    await ctx.answerCallbackQuery({ text: 'Allowed + правило' }).catch(() => {});
+    await ctx.editMessageText(`${ctx.callbackQuery.message?.text || ''}\n\n✅ Allowed — правило применено`).catch(() => {});
     return;
   }
 

@@ -104,7 +104,7 @@ function onHub(m) {
     boundChatId = String(m.meta?.chat_id || boundChatId || '');
     injectUser(String(m.content ?? ''));
   } else if (m.t === 'permission_decision') {
-    resolveApproval(m.request_id, m.behavior, m.answers, m.message);
+    resolveApproval(m.request_id, m.behavior, m.answers, m.message, m.suggestion);
   } else if (m.t === 'command') {
     cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || ''));
   } else if (m.t === 'stop') {
@@ -147,21 +147,25 @@ function offerApproval(req, request_id) {
   if (!boundChatId) return;   // only route to TG once a remote user is engaged with this session
   const synthId = newSynthId();
   const tool = req.tool_name || req.display_name || 'tool';
-  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false, tool });
+  // Keep the engine's permission_suggestions verbatim — the hub only names them and
+  // sends back an INDEX, so what we hand the engine stays byte-identical to its offer.
+  const sug = Array.isArray(req.permission_suggestions) ? req.permission_suggestions : [];
+  approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false, tool, suggestions: sug });
   synthToReal.set(synthId, request_id);
   const ask = askOf(tool, req.input);   // AskUserQuestion -> real option buttons instead of Allow/Deny
   sendHub({ t: 'permission_request', sessionId, request_id: synthId,
     tool_name: tool,
     description: req.description || '',
-    input_preview: toolPreview(tool, req.input), ...(ask ? { ask } : {}) });
-  log('approval -> hub', { synthId, tool, request_id, ask: !!ask });
+    input_preview: toolPreview(tool, req.input), ...(ask ? { ask } : {}), ...(sug.length && !ask ? { suggestions: sug } : {}) });
+  log('approval -> hub', { synthId, tool, request_id, ask: !!ask, suggestions: sug.length });
 }
-function resolveApproval(synthId, behavior, picks, denyMsg) {
+function resolveApproval(synthId, behavior, picks, denyMsg, sugIdx) {
   const realId = synthToReal.get(synthId);
   if (!realId) return;
   const a = approvals.get(realId);
   if (!a || a.resolved) return;   // already answered (by the panel, or a prior verdict)
   a.resolved = true; a.tgResolved = true;
+  const sug = sugIdx == null ? null : a.suggestions?.[sugIdx];   // index -> the ORIGINAL suggestion object
   // 1) dismiss the panel's own dialog for this request the way the engine does on
   //    interrupt — the extension acks with an abort control_response that onIn drops
   //    (the engine must only ever see our verdict below, not that abort).
@@ -169,10 +173,12 @@ function resolveApproval(synthId, behavior, picks, denyMsg) {
   // 2) give the engine the verdict so the tool proceeds / is denied.
   const response = behavior === 'allow'
     // picks -> answers on the ORIGINAL input (exact question/label text); no picks -> input untouched
-    ? { behavior: 'allow', updatedInput: picks ? buildAnswers(a.input, picks) : a.input, updatedPermissions: [], toolUseID: a.toolUseId }
+    ? { behavior: 'allow', updatedInput: picks ? buildAnswers(a.input, picks) : a.input,
+        updatedPermissions: sug ? [sug] : [], toolUseID: a.toolUseId,
+        ...(sug ? { decisionClassification: sug.destination === 'session' ? 'user_temporary' : 'user_permanent' } : {}) }
     : { behavior: 'deny', message: String(denyMsg || 'Denied via Telegram') };   // message is mandatory
   const ctl = { type: 'control_response', response: { subtype: 'success', request_id: realId, response } };
-  try { child.stdin.write(JSON.stringify(ctl) + '\n'); log('INJECT verdict + cancel panel dialog', { realId, behavior, answered: !!picks }); }
+  try { child.stdin.write(JSON.stringify(ctl) + '\n'); log('INJECT verdict + cancel panel dialog', { realId, behavior, answered: !!picks, suggestion: sug || null }); }
   catch (e) { log('verdict inject err', String(e)); }
 }
 
