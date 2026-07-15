@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { createCommands } from './commands.mjs';
+import { askOf, buildAnswers } from './ask.mjs';
 
 // ── config / logging ─────────────────────────────────────────────────────────
 const SESSION_ID = process.env.SESSION_ID || ('headless-' + process.pid);
@@ -62,7 +63,7 @@ function onHub(m) {
     boundChatId = String(m.meta?.chat_id || boundChatId || OWNER || '');
     injectUser(String(m.content ?? ''));
   } else if (m.t === 'permission_decision') {
-    resolveApproval(m.request_id, m.behavior);
+    resolveApproval(m.request_id, m.behavior, m.answers, m.message);
   } else if (m.t === 'command') {
     cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || OWNER || ''));
   } else if (m.t === 'stop') {
@@ -101,20 +102,22 @@ function offerApproval(req, request_id) {
   approvals.set(request_id, { synthId, input: req.input, toolUseId: req.tool_use_id, resolved: false });
   synthToReal.set(synthId, request_id);
   const tool = req.tool_name || req.display_name || 'tool';
-  sendHub({ t: 'permission_request', sessionId: SESSION_ID, request_id: synthId, tool_name: tool, description: req.description || '', input_preview: toolPreview(tool, req.input) });
-  log('approval -> hub', { synthId, tool, request_id });
+  const ask = askOf(tool, req.input);   // AskUserQuestion -> real option buttons instead of Allow/Deny
+  sendHub({ t: 'permission_request', sessionId: SESSION_ID, request_id: synthId, tool_name: tool, description: req.description || '', input_preview: toolPreview(tool, req.input), ...(ask ? { ask } : {}) });
+  log('approval -> hub', { synthId, tool, request_id, ask: !!ask });
 }
-function resolveApproval(synthId, behavior) {
+function resolveApproval(synthId, behavior, picks, denyMsg) {
   const realId = synthToReal.get(synthId);
   if (!realId) return;
   const a = approvals.get(realId);
   if (!a || a.resolved) return;
   a.resolved = true;
   const response = behavior === 'allow'
-    ? { behavior: 'allow', updatedInput: a.input, updatedPermissions: [], toolUseID: a.toolUseId }
-    : { behavior: 'deny', message: 'Denied via Telegram' };
+    // picks -> answers on the ORIGINAL input (exact question/label text); no picks -> input untouched
+    ? { behavior: 'allow', updatedInput: picks ? buildAnswers(a.input, picks) : a.input, updatedPermissions: [], toolUseID: a.toolUseId }
+    : { behavior: 'deny', message: String(denyMsg || 'Denied via Telegram') };   // message is mandatory
   toEngine({ type: 'control_response', response: { subtype: 'success', request_id: realId, response } });
-  log('INJECT verdict', { realId, behavior });
+  log('INJECT verdict', { realId, behavior, answered: !!picks });
 }
 
 // ── engine output handler ─────────────────────────────────────────────────────

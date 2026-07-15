@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
 import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { spawnSession } from './session.mjs';
+import { askOf } from './panel/ask.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -64,6 +65,7 @@ const sessions = new Map();    // sessionId -> { conn, cwd, label }  (LIVE only 
 const order = [];
 const pendingPerm = new Map(); // request_id -> sessionId
 const permMsg = new Map();      // request_id -> approval-card message_id (home chat), for clearing buttons
+const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
@@ -251,6 +253,16 @@ async function sendTg(chatId, text, sid, extra = {}) {
   }
   return last;
 }
+// Edit a card in place — same render path as sendTg (HTML + plain fallback), but NO
+// chunking: callers must keep the card under the limit (askCard truncates for this).
+// Default empty inline_keyboard so a final card reliably loses its buttons.
+async function editTg(chatId, messageId, text, extra = {}) {
+  const t = String(text ?? '');
+  const opts = { link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] }, ...extra };
+  try { return await bot.api.editMessageText(chatId, messageId, mdToTgHtml(t), { parse_mode: 'HTML', ...opts }); }
+  catch { try { return await bot.api.editMessageText(chatId, messageId, t, opts); } catch (e) { console.error('editTg', e?.message); } }
+  return null;
+}
 
 function replyKeyboard() {
   const k = new Keyboard();
@@ -267,6 +279,44 @@ function controlPad(id) {
     .text('🧮 контекст', `cmd:${id}:context`).text('🌐 remote', `cmd:${id}:rc`).row()
     .text('⏳ лимит', `cmd:${id}:limits`).text('🗜 compact', `cmd:${id}:compact`).text('⏹ прервать', `cmd:${id}:interrupt`).row();
 }
+// ── AskUserQuestion cards ────────────────────────────────────────────────────
+// The engine offers AskUserQuestion as a normal approval, but a one-tap Allow/Deny
+// would answer NOTHING (the tool reads the pick from updatedInput.answers). Stream
+// sessions send us the parsed `ask`, so we render the real options as buttons; the
+// pick travels back as INDICES and the client rebuilds answers off the original input.
+const btnLabel = s => (s.length > 40 ? s.slice(0, 39) + '…' : s);
+// ONE question per card. Text is Markdown source (mdToTgHtml escapes it downstream) and
+// is truncated hard so sendTg never chunks it — a chunked card would strand the keyboard
+// on a second message that editTg can't keep in sync with the first.
+function askCard(rid) {
+  const st = askState.get(rid); if (!st) return null;
+  const q = st.qs.questions[st.cur], sel = st.picks[st.cur], n = st.qs.questions.length;
+  const head = `❓ [${labelOf(st.sessionId)}] ${q.header || 'Вопрос'}${n > 1 ? ` · ${st.cur + 1}/${n}` : ''}`;
+  const body = q.options.map((o, i) =>
+    `${sel.includes(i) ? '☑' : '▫️'} **${o.label}**${o.description ? ` — ${o.description.slice(0, 200)}` : ''}`).join('\n');
+  const text = `${head}\n${q.question.slice(0, 700)}\n\n${body}${q.multiSelect ? '\n\n_можно выбрать несколько_' : ''}`;
+  const kb = new InlineKeyboard();
+  q.options.forEach((o, i) => kb.text(`${q.multiSelect ? (sel.includes(i) ? '☑ ' : '☐ ') : ''}${btnLabel(o.label)}`, `ask:${rid}:${st.cur}:${i}`).row());
+  if (q.multiSelect) kb.text(sel.length ? `✔ Готово (${sel.length})` : '✔ Готово', `ask:${rid}:${st.cur}:ok`);
+  kb.text('❌ Отмена', `ask:${rid}:x`).row();
+  return { text, kb };
+}
+function askSummary(st) {
+  return `✅ [${labelOf(st.sessionId)}] ответ отправлен\n` + st.qs.questions.map((q, qi) =>
+    `• ${q.header || q.question}: **${st.picks[qi].map(i => q.options[i].label).join(', ') || '—'}**`).join('\n');
+}
+// Channels CLI path: the permission reply schema is hard-wired to {request_id, behavior}
+// — no slot for updatedInput, so a structural answer is impossible there. Best we can do
+// is parse the JSON-string input_preview and PRINT the choices readably.
+function askDigest(tool, preview) {
+  let input; try { input = JSON.parse(preview); } catch { return null; }
+  const ask = askOf(tool, input); if (!ask) return null;
+  return ask.questions.map((q, qi) =>
+    `**${qi + 1}. ${q.header || 'Вопрос'}**${q.multiSelect ? ' (мультивыбор)' : ''}\n${q.question}\n` +
+    q.options.map((o, i) => `  ${i + 1}) ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
+  ).join('\n\n') + '\n\n⚠️ Сессия на channels — выбрать вариант отсюда нельзя. Allow пропустит вопрос БЕЗ ответа; лучше Deny и напишите ответ обычным сообщением.';
+}
+
 function sessionInline() {
   const k = new InlineKeyboard();
   for (const id of order) { k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
@@ -476,13 +526,20 @@ net.createServer(sock => {
         sendTg(m.chat_id || CHAT, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId);
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
-        const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
-        const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (m.input_preview ? `\n${m.input_preview}` : '');
-        sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+        if (m.ask) {                                   // stream path: structural questions -> option buttons
+          askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0 });
+          const c = askCard(m.request_id);
+          sendTg(CHAT, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+        } else {                                       // channels (or any other tool): Allow/Deny as before
+          const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`);
+          const pv = (m.input_preview && askDigest(m.tool_name, m.input_preview)) || m.input_preview;
+          const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (pv ? `\n${pv}` : '');
+          sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+        }
       } else if (m.t === 'approval_cancel') {
         // The session answered this approval elsewhere (e.g. in the VSCode panel) —
         // drop the now-stale Telegram buttons.
-        pendingPerm.delete(m.request_id);
+        pendingPerm.delete(m.request_id); askState.delete(m.request_id);
         const mid = permMsg.get(m.request_id); permMsg.delete(m.request_id);
         if (mid) bot.api.editMessageText(CHAT, mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
       } else if (m.t === 'inject') {
@@ -536,6 +593,7 @@ net.createServer(sock => {
     if (sessions.get(sid)?.conn !== sock) return; // superseded by a newer registration — ignore this orphan
     const label = labelOf(sid);
     sessions.delete(sid);
+    for (const [rid, st] of askState) if (st.sessionId === sid) askState.delete(rid); // its cards can never resolve now
     const i = order.indexOf(sid); if (i >= 0) order.splice(i, 1);
     if (active === sid) active = order[order.length - 1] || null;
     // Decide the durable fate by whether the claude process is actually gone.
@@ -657,6 +715,53 @@ bot.on('callback_query:data', async ctx => {
     permMsg.delete(rid);
     await ctx.answerCallbackQuery({ text: behavior === 'allow' ? 'Allowed' : 'Denied' }).catch(() => {});
     await ctx.editMessageText(`${ctx.callbackQuery.message?.text || ''}\n\n${behavior === 'allow' ? '✅ Allowed' : '❌ Denied'}`).catch(() => {});
+    return;
+  }
+
+  // AskUserQuestion: cancel the whole card → deny. The engine hands `message` to the
+  // model as the tool result, so it learns WHY there's no answer (and deny needs one).
+  if ((m = /^ask:([a-z]{5}):x$/.exec(data))) {
+    const rid = m[1], st = askState.get(rid);
+    if (!st) { await ctx.answerCallbackQuery({ text: 'expired' }).catch(() => {}); return; }
+    askState.delete(rid); pendingPerm.delete(rid); permMsg.delete(rid);
+    sendToSession(st.sessionId, { t: 'permission_decision', request_id: rid, behavior: 'deny', message: 'User cancelled the question in Telegram.' });
+    await ctx.answerCallbackQuery({ text: 'Отменено' }).catch(() => {});
+    await editTg(CHAT, ctx.callbackQuery.message.message_id, `❓ [${labelOf(st.sessionId)}] — ❌ отменено`);
+    return;
+  }
+
+  // AskUserQuestion: pick/toggle an option. Indices only (callback_data ≤ 64 bytes, and
+  // they address the ORIGINAL engine input — see panel/ask.mjs).
+  if ((m = /^ask:([a-z]{5}):([0-3]):([0-3]|ok)$/.exec(data))) {
+    const [, rid, qs_, act] = m;
+    const st = askState.get(rid);
+    if (!st) { await ctx.answerCallbackQuery({ text: 'expired' }).catch(() => {}); return; }
+    const qi = Number(qs_), q = st.qs.questions[qi];
+    if (!q || qi !== st.cur) { await ctx.answerCallbackQuery({ text: 'stale' }).catch(() => {}); return; } // tap on an already-passed question
+    const sel = st.picks[qi], mid = ctx.callbackQuery.message.message_id;
+    if (act === 'ok') {
+      if (!sel.length) { await ctx.answerCallbackQuery({ text: 'выберите хотя бы один вариант' }).catch(() => {}); return; }
+    } else {
+      const oi = Number(act);
+      if (!q.options[oi]) { await ctx.answerCallbackQuery().catch(() => {}); return; }
+      if (q.multiSelect) {                                  // toggle in place, commit on ✔
+        const k = sel.indexOf(oi); if (k >= 0) sel.splice(k, 1); else sel.push(oi);
+        await ctx.answerCallbackQuery().catch(() => {});
+        const c = askCard(rid);
+        await editTg(CHAT, mid, c.text, { reply_markup: c.kb });
+        return;
+      }
+      st.picks[qi] = [oi];                                  // single select commits on tap
+    }
+    await ctx.answerCallbackQuery().catch(() => {});
+    if (++st.cur < st.qs.questions.length) {                // next question, SAME card
+      const c = askCard(rid);
+      await editTg(CHAT, mid, c.text, { reply_markup: c.kb });
+      return;
+    }
+    askState.delete(rid); pendingPerm.delete(rid); permMsg.delete(rid);
+    sendToSession(st.sessionId, { t: 'permission_decision', request_id: rid, behavior: 'allow', answers: st.picks });
+    await editTg(CHAT, mid, askSummary(st));
     return;
   }
 
