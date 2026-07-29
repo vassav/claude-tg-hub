@@ -62,6 +62,16 @@ assert.equal(can('123', 'group', true), false, 'бот');
 access.remove('123');
 assert.equal(can('123', 'group'), false, 'пустой список — не проходит никто, кроме владельца');
 assert.equal(can(OWNER, 'private'), true);
+// falsy owner guard
+access.add('123', 'ivan', OWNER);
+const canNoOwner = (userId, chatType, isBot = false) => access.canUse({ userId, chatType, isBot }, { owner: undefined });
+const canEmptyOwner = (userId, chatType, isBot = false) => access.canUse({ userId, chatType, isBot }, { owner: '' });
+assert.equal(canNoOwner(undefined, 'private'), false, 'undefined owner, undefined userId → false');
+assert.equal(canNoOwner('999', 'private'), false, 'undefined owner, random userId → false');
+assert.equal(canNoOwner('123', 'group'), false, 'undefined owner, listed user in group → false');
+assert.equal(canEmptyOwner(undefined, 'private'), false, 'empty owner, undefined userId → false');
+assert.equal(canEmptyOwner('999', 'private'), false, 'empty owner, random userId → false');
+assert.equal(canEmptyOwner('123', 'group'), false, 'empty owner, listed user in group → false');
 ok('canUse: таблица гейта');
 
 // 7. parseTarget

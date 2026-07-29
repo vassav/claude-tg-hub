@@ -54,6 +54,7 @@ export function remove(id) {
 // group chat but never in a DM — DMs with the bot stay owner-only.
 export function canUse({ userId, chatType, isBot }, { owner }) {
   if (isBot) return false;
+  if (!owner) return false;
   if (String(userId) === String(owner)) return true;
   return chatType !== 'private' && !!roleOf(userId);
 }
