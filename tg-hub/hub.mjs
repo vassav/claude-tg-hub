@@ -692,6 +692,37 @@ bot.command('id', async ctx => {
   await ctx.reply(`chat_id: ${ctx.chat.id}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`);
 });
 
+// ── access list management (owner only) ──────────────────────────────────────
+// Managing the list is owner-only even though listed people otherwise have full
+// rights: a list that can extend itself stops being a list. Bot API cannot turn an
+// @username into a user_id, so a target is either the quoted message's author or an
+// explicit numeric id.
+const isOwner = ctx => String(ctx.from?.id) === OWNER;
+const ALLOW_USAGE = 'usage: /allow <user_id> [имя]\nили ответь этой командой на сообщение человека';
+
+bot.command('allow', async ctx => {
+  if (!isOwner(ctx)) { if (owns(ctx)) await ctx.reply('только владелец может менять список'); return; }
+  const t = access.parseTarget(ctx.match, ctx.message?.reply_to_message?.from);
+  if (!t) { await ctx.reply(ALLOW_USAGE); return; }
+  if (t.id === OWNER) { await ctx.reply('это ты — владелец, тебе список не нужен'); return; }
+  await ctx.reply(access.add(t.id, t.name, ctx.from.id)
+    ? `✅ ${t.name} (${t.id}) добавлен — может писать боту в групповых чатах`
+    : `${t.name} (${t.id}) уже в списке`);
+});
+
+bot.command('deny', async ctx => {
+  if (!isOwner(ctx)) { if (owns(ctx)) await ctx.reply('только владелец может менять список'); return; }
+  const t = access.parseTarget(ctx.match, ctx.message?.reply_to_message?.from);
+  if (!t) { await ctx.reply(ALLOW_USAGE.replace(/allow/g, 'deny')); return; }
+  await ctx.reply(access.remove(t.id) ? `🚫 ${t.name} (${t.id}) удалён из списка` : `${t.name} (${t.id}) в списке и не был`);
+});
+
+bot.command('who', async ctx => {
+  if (!owns(ctx)) return;
+  const rows = access.list().map(u => `• ${u.name} (${u.id}) — добавил ${u.by || '?'}, ${String(u.added || '').slice(0, 10)}`);
+  await ctx.reply([`👤 владелец: ${OWNER}`, ...(rows.length ? rows : ['список пуст — /allow реплаем на сообщение человека'])].join('\n'));
+});
+
 bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
   const resumable = resumableEntries();
