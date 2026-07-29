@@ -24,6 +24,7 @@ import dotenv from 'dotenv';
 import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
+import * as access from './access.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -675,15 +676,21 @@ net.createServer(sock => {
 }).listen(PORT, '127.0.0.1', () => console.error(`[hub] IPC on 127.0.0.1:${PORT}`));
 
 // ── Telegram ─────────────────────────────────────────────────────────────────
-// Access gate: the owner (in any chat) OR anyone writing in the bot's home chat —
-// so a configured HUB_CHAT_ID group works for its members. When HUB_CHAT_ID is
-// unset, CHAT===OWNER, so this stays owner-only (identical to before).
-const owns = ctx => String(ctx.from?.id) === OWNER || String(ctx.chat?.id) === CHAT;
+// Access gate: the owner (in any chat, DM included) OR anyone on the access list —
+// but only from a GROUP chat. DMs with the bot stay owner-only. See access.mjs.
+const owns = ctx => access.canUse(
+  { userId: ctx.from?.id, chatType: ctx.chat?.type, isBot: ctx.from?.is_bot },
+  { owner: OWNER });
 
 bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard() }); });
 
-// Discover a chat's id (run it in a group to get the negative id for HUB_CHAT_ID).
-bot.command('id', async ctx => { if (!owns(ctx)) return; await ctx.reply(`chat_id: ${ctx.chat.id}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`); });
+// Discover a chat's id. Open to everyone in a GROUP (it reveals only the caller's own
+// id and the chat's) — that's how a newcomer can hand the owner their id. In a DM it
+// stays owner-only, like every other DM interaction.
+bot.command('id', async ctx => {
+  if (ctx.chat?.type === 'private' && String(ctx.from?.id) !== OWNER) return;
+  await ctx.reply(`chat_id: ${ctx.chat.id}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`);
+});
 
 bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
