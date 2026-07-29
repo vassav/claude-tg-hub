@@ -26,6 +26,7 @@ import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound } from './chat-target.mjs';
+import { sendRich, RICH_LIMIT } from './rich.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -271,6 +272,22 @@ async function sendTg(chatId, text, sid, extra = {}, firstExtra = {}) {
     if (sent) last = sent;
   }
   return last;
+}
+// Session answers go out as Rich Messages: the model's Markdown is handed to Telegram
+// untouched, which renders real tables, headings and syntax-highlighted code. Falls back to
+// the HTML path on ANY failure — an old self-hosted Bot API server (TELEGRAM_API_ROOT), a
+// rejected payload (500 blocks / 20 columns / 16 nesting levels), or a network blip.
+// Text over RICH_LIMIT goes the old way too, where chunkText splits it.
+async function sendMd(chatId, text, sid, extra = {}, firstExtra = {}) {
+  const body = String(text ?? '');
+  if (body.length <= RICH_LIMIT) {
+    const sent = await sendRich({ apiRoot: API_ROOT, token: TOKEN, chatId, markdown: body, extra: { ...firstExtra, ...extra } });
+    if (sent?.message_id) {
+      if (sid) outMsgToSession.set(sent.message_id, sid);   // keep "reply to a bot message → its session" working
+      return sent;
+    }
+  }
+  return sendTg(chatId, body, sid, extra, firstExtra);
 }
 // Edit a card in place — same render path as sendTg (HTML + plain fallback), but NO
 // chunking: callers must keep the card under the limit (askCard truncates for this).
@@ -600,7 +617,7 @@ net.createServer(sock => {
       } else if (m.t === 'reply') {
         const to = m.chat_id || CHAT;
         const last = lastInbound.get(m.sessionId);
-        sendTg(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
+        sendMd(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
         if (last) last.pending = false;  // answered — the next writer isn't competing with anyone
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
