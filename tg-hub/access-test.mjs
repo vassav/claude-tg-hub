@@ -57,6 +57,11 @@ assert.equal(can(OWNER, 'supergroup'), true, 'владелец в группе')
 assert.equal(can('123', 'group'), true, 'списочник в группе');
 assert.equal(can('123', 'supergroup'), true, 'списочник в супергруппе');
 assert.equal(can('123', 'private'), false, 'списочник в личке — нельзя');
+assert.equal(can('123', 'channel'), false, 'списочник в channel — нельзя');
+assert.equal(can('123', undefined), false, 'списочник без chatType — нельзя');
+assert.equal(can(OWNER, 'group'), true, 'владелец в group');
+assert.equal(can(OWNER, 'channel'), true, 'владелец в channel');
+assert.equal(can(OWNER, undefined), true, 'владелец без chatType');
 assert.equal(can('999', 'group'), false, 'чужак в группе');
 assert.equal(can('123', 'group', true), false, 'бот');
 access.remove('123');

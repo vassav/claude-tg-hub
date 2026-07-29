@@ -50,13 +50,14 @@ export function remove(id) {
   return ok;
 }
 
-// The gate. Owner passes anywhere (DM included). Anyone on the list passes in ANY
-// group chat but never in a DM — DMs with the bot stay owner-only.
+// The gate. Owner passes anywhere (DM included). Anyone on the list passes in any GROUP
+// chat (group or supergroup) but never in a DM, a channel, or an unknown chat type — DMs
+// with the bot stay owner-only.
 export function canUse({ userId, chatType, isBot }, { owner }) {
   if (isBot) return false;
   if (!owner) return false;
   if (String(userId) === String(owner)) return true;
-  return chatType !== 'private' && !!roleOf(userId);
+  return (chatType === 'group' || chatType === 'supergroup') && !!roleOf(userId);
 }
 
 // `/allow` target: the quoted message's author if the command was a reply, else the

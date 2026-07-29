@@ -39,9 +39,14 @@ assert.equal(e1.pending, true);
 const e2 = nextInbound(e1, mA2);
 assert.equal(e2.ambiguous, false, 'тот же автор пишет повторно, пока не отвечено — не спорно');
 
-// a DIFFERENT user writes while pending → ambiguous
+// a DIFFERENT user writes in the SAME chat while pending → ambiguous
 const e3 = nextInbound(e1, mB);
-assert.equal(e3.ambiguous, true, 'другой автор пишет, пока не отвечено — спорно');
+assert.equal(e3.ambiguous, true, 'другой автор пишет в том же чате, пока не отвечено — спорно');
+
+// a DIFFERENT user writes in a DIFFERENT chat while pending → not ambiguous (contest is per-chat)
+const mD = { chat_id: '-100999', message_id: '9', user: 'dave', user_id: '4' };
+const e3b = nextInbound(e1, mD);
+assert.equal(e3b.ambiguous, false, 'другой автор пишет в ДРУГОМ чате, пока не отвечено — не спорно');
 
 // a different user writes when the prior entry is NOT pending (already answered) → not ambiguous
 const answered = { ...e1, pending: false };

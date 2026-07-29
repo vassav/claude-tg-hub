@@ -72,7 +72,7 @@ const pendingPerm = new Map(); // request_id -> sessionId
 const permMsg = new Map();      // request_id -> { mid, chat } of the approval/ask card, for clearing buttons
 const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
-const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user } of the message that most recently drove it
+const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, user_id, pending, ambiguous } of the message that most recently drove it
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
@@ -610,7 +610,21 @@ net.createServer(sock => {
           const askChat = askChatFor(lastInbound.get(m.sessionId), CHAT);
           askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0, chatId: askChat });
           const c = askCard(m.request_id);
-          sendTg(askChat, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, { mid: sent.message_id, chat: askChat }); });
+          sendTg(askChat, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => {
+            if (sent?.message_id) { permMsg.set(m.request_id, { mid: sent.message_id, chat: askChat }); return; }
+            if (askChat === CHAT) return; // already tried the owner's DM — nothing left to fall back to
+            // sendTg swallows failures and returns null; if the group chat is gone, migrated
+            // to a new id, or the bot is restricted there, the card would render nowhere
+            // while pendingPerm/askState stay set — a card nobody can see hangs the session
+            // with no way to answer it. Re-send to the owner's DM and repoint askState so the
+            // four later editTg(st.chatId, …) sites (cancel, redraw, next question, summary)
+            // edit the chat that actually has the card.
+            const st = askState.get(m.request_id);
+            if (st) st.chatId = CHAT;
+            sendTg(CHAT, c.text, m.sessionId, { reply_markup: c.kb }).then(sent2 => {
+              if (sent2?.message_id) permMsg.set(m.request_id, { mid: sent2.message_id, chat: CHAT });
+            });
+          });
         } else {                                       // channels (or any other tool): Allow/Deny as before
           const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`).row();
           // …plus the engine's own "don't ask again" offers (stream sessions only)
