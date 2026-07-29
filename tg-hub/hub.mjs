@@ -25,8 +25,8 @@ import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
-import { replyExtra, askChatFor, nextInbound } from './chat-target.mjs';
-import { sendRich, RICH_LIMIT } from './rich.mjs';
+import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
+import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -74,6 +74,8 @@ const permMsg = new Map();      // request_id -> { mid, chat } of the approval/a
 const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
 const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, user_id, pending, ambiguous } of the message that most recently drove it
+const thinking = new Map();   // sessionId -> { chatId, draftId, startedAt, tokens, timer } — live "Thinking…" draft
+let draftSeq = 0;             // draft_id must be a non-zero Integer; a NEW one per turn, since same-id edits animate
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
@@ -300,6 +302,33 @@ async function editTg(chatId, messageId, text, extra = {}) {
   return null;
 }
 
+// While a session works, show a live draft instead of silence. Drafts are ephemeral (30s),
+// animated between updates sharing a draft_id, and PRIVATE CHATS ONLY — a group gets no
+// bubble (sendRichMessageDraft answers TEXTDRAFT_PEER_INVALID there). Failure costs nothing:
+// a draft is not a message, nothing references it.
+const THINK_EVERY_MS = 10000;    // draft TTL is 30s — three shots at each refresh
+const THINK_MAX_MS = 600000;     // safety net: stop pretending after 10 minutes
+function paintThinking(id) {
+  const e = thinking.get(id); if (!e) return;
+  if (Date.now() - e.startedAt > THINK_MAX_MS) { stopThinking(id); return; }
+  sendThinking({ apiRoot: API_ROOT, token: TOKEN, chatId: e.chatId, draftId: e.draftId,
+    text: thinkingText({ startedAt: e.startedAt, tokens: e.tokens }) });
+}
+function startThinking(id, chatId) {
+  if (isGroup(chatId)) return;              // drafts don't exist in groups
+  stopThinking(id);                          // a new turn gets a fresh draft_id
+  const e = { chatId: Number(chatId), draftId: ++draftSeq, startedAt: Date.now(), tokens: 0, timer: null };
+  thinking.set(id, e);
+  paintThinking(id);
+  e.timer = setInterval(() => paintThinking(id), THINK_EVERY_MS);
+  e.timer.unref?.();                         // never hold the daemon open on this alone
+}
+function stopThinking(id) {
+  const e = thinking.get(id); if (!e) return;
+  clearInterval(e.timer);
+  thinking.delete(id);
+}
+
 function replyKeyboard() {
   const k = new Keyboard();
   if (order.length) { for (const id of order) k.text(labelOf(id) + (id === active ? ' ✓' : '')); k.row(); }
@@ -387,6 +416,7 @@ async function routeTo(ctx, id, body) {
   // first is answered — nextInbound() tracks that and marks the entry ambiguous so
   // we quote nobody rather than the wrong person (see chat-target.mjs).
   lastInbound.set(id, nextInbound(lastInbound.get(id), meta));
+  startThinking(id, meta.chat_id);   // silence → a live draft while the session works
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
 }
 
@@ -615,11 +645,13 @@ net.createServer(sock => {
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
+        stopThinking(m.sessionId);   // the answer itself replaces the draft
         const to = m.chat_id || CHAT;
         const last = lastInbound.get(m.sessionId);
         sendMd(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
         if (last) last.pending = false;  // answered — the next writer isn't competing with anyone
       } else if (m.t === 'permission_request') {
+        stopThinking(m.sessionId);
         pendingPerm.set(m.request_id, m.sessionId);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
           // The card belongs where the question came from: a person asking from a group
@@ -708,6 +740,7 @@ net.createServer(sock => {
     const label = labelOf(sid);
     sessions.delete(sid);
     lastInbound.delete(sid); // a resume reuses this id — don't quote a message from its previous life
+    stopThinking(sid);
     for (const [rid, st] of askState) if (st.sessionId === sid) askState.delete(rid); // its cards can never resolve now
     const i = order.indexOf(sid); if (i >= 0) order.splice(i, 1);
     if (active === sid) active = order[order.length - 1] || null;
@@ -797,6 +830,7 @@ bot.command('stop', async ctx => {
   const id = order.find(x => labelOf(x) === arg || x === arg);
   if (!id) { await ctx.reply('not found — /sessions to list'); return; }
   sendToSession(id, { t: 'stop' });
+  stopThinking(id);
   registry.delete(id); saveRegistry(); // explicit stop → don't offer as resumable
   await ctx.reply(`🛑 stopping ${labelOf(id)}…`);
 });
@@ -838,7 +872,7 @@ bot.on('callback_query:data', async ctx => {
 
   if ((m = /^stop:(.+)$/.exec(data))) {
     const id = m[1];
-    if (sessions.has(id)) { sendToSession(id, { t: 'stop' }); registry.delete(id); saveRegistry(); await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); }
+    if (sessions.has(id)) { sendToSession(id, { t: 'stop' }); stopThinking(id); registry.delete(id); saveRegistry(); await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); }
     else await ctx.answerCallbackQuery({ text: 'already gone' }).catch(() => {});
     return;
   }
