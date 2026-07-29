@@ -28,11 +28,12 @@ ok('sendRich: зовёт sendRichMessage и возвращает Message');
 const fakeFalse = async () => ({ json: async () => ({ ok: false, description: 'Bad Request: nope' }) });
 const fakeThrow = async () => { throw new Error('socket hang up'); };
 const fakeGarbage = async () => ({ json: async () => { throw new Error('not json'); } });
-for (const [label, f] of [['ok:false', fakeFalse], ['исключение сети', fakeThrow], ['нечитаемый ответ', fakeGarbage]]) {
+const fakeNoResult = async () => ({ json: async () => ({ ok: true }) });
+for (const [label, f] of [['ok:false', fakeFalse], ['исключение сети', fakeThrow], ['нечитаемый ответ', fakeGarbage], ['ok:true без result', fakeNoResult]]) {
   const r = await sendRich({ apiRoot: 'x', token: 'T', chatId: '1', markdown: 'y', fetchImpl: f });
   assert.equal(r, null, label);
 }
-ok('sendRich: ok:false / бросок / мусор → null, без исключения наружу');
+ok('sendRich: ok:false / бросок / мусор / ok:true без result → null, без исключения наружу');
 
 // 4. sendThinking
 const draftCalls = [];

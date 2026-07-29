@@ -23,7 +23,7 @@ async function post(apiRoot, token, method, body, fetchImpl) {
 export async function sendRich({ apiRoot, token, chatId, markdown, extra, fetchImpl }) {
   try {
     const j = await post(apiRoot, token, 'sendRichMessage', richBody({ chatId, markdown, extra }), fetchImpl);
-    return j?.ok ? j.result : null;
+    return j?.ok && j.result ? j.result : null;
   } catch { return null; }
 }
 
