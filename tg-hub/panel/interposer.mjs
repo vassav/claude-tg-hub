@@ -28,7 +28,7 @@ import { join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { createCommands } from './commands.mjs';
+import { createCommands, chromeBridgeConfig, BROWSER_MENTION } from './commands.mjs';
 import { askOf, buildAnswers } from './ask.mjs';
 
 // ── logging ──────────────────────────────────────────────────────────────────
@@ -77,6 +77,9 @@ const { port: HUB_PORT, token: HUB_TOKEN } = discover();
 
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
 let sessionId = null, cwd = process.cwd(), boundChatId = '';
+// browser MCP co-ownership with the panel: base = the panel's last dynamic-server
+// map (chrome-less), flags track who enabled chrome and whether it is on now.
+let hostServers = {}, hostHadChrome = false, browserOn = false;
 
 function connectHub() {
   hub = net.connect({ host: '127.0.0.1', port: HUB_PORT }, () => {
@@ -102,7 +105,9 @@ function onHub(m) {
   log('HUB->', m);
   if (m.t === 'inbound') {
     boundChatId = String(m.meta?.chat_id || boundChatId || '');
-    injectUser(String(m.content ?? ''));
+    const text = String(m.content ?? '');
+    if (BROWSER_MENTION.test(text)) cmds.injectBrowser(text, boundChatId);
+    else injectUser(text);
   } else if (m.t === 'permission_decision') {
     resolveApproval(m.request_id, m.behavior, m.answers, m.message, m.suggestion);
   } else if (m.t === 'command') {
@@ -128,6 +133,8 @@ function injectUser(text) {
 const cmds = createCommands({
   toEngine: obj => { try { child.stdin.write(JSON.stringify(obj) + '\n'); } catch (e) { log('ctl write err', String(e)); } },
   sendHub, sessionId: () => sessionId, owner: process.env.HUB_OWNER_ID || '', injectUser,
+  browser: { bridge: () => chromeBridgeConfig(exe, rest), servers: () => hostServers,
+    enabled: () => browserOn, setEnabled: v => { browserOn = v; } },
 });
 
 // ── 3d: approvals (variant B — dual, first responder wins) ───────────────────
@@ -195,10 +202,11 @@ function inForwarder() {
       const l = buf.slice(0, i); buf = buf.slice(i + 1);
       if (!l.trim()) { child.stdin.write(l + '\n'); continue; }
       logLine('IN  >>', l);
-      let o = null, drop = false;
+      let o = null, drop = false, rewrite = null;
       try { o = JSON.parse(l); } catch {}
-      if (o) { try { drop = onIn(o) === DROP; } catch (e) { log('onIn err', String(e)); } }
-      if (!drop) child.stdin.write(l + '\n');
+      if (o) { try { const r = onIn(o); if (r === DROP) drop = true; else if (r && typeof r === 'object') rewrite = JSON.stringify(r); } catch (e) { log('onIn err', String(e)); } }
+      if (rewrite) log('REWRITE >>', rewrite.slice(0, 300));
+      if (!drop) child.stdin.write((rewrite ?? l) + '\n');
     }
   };
 }
@@ -256,6 +264,22 @@ function onOut(o) {                                   // engine -> extension
   }
 }
 function onIn(o) {                                    // extension -> engine
+  // mcp_set_servers REPLACES the engine's whole dynamic-server set, and both we
+  // and the panel send it. Track the panel's map as our merge base; after WE
+  // enabled chrome, keep re-adding it to panel updates that lack it — but a map
+  // where the panel ITSELF had chrome and dropped it is an explicit disable from
+  // the panel UI: respect it.
+  if (o.type === 'control_request' && o.request?.subtype === 'mcp_set_servers') {
+    const servers = o.request.servers || {};
+    const hasChrome = !!servers['claude-in-chrome'];
+    const prevHostHadChrome = hostHadChrome;
+    hostHadChrome = hasChrome;
+    hostServers = { ...servers }; delete hostServers['claude-in-chrome'];
+    if (hasChrome) { browserOn = true; return; }
+    if (browserOn && prevHostHadChrome) { browserOn = false; log('panel disabled browser MCP'); return; }
+    if (browserOn) return { ...o, request: { ...o.request, servers: { ...servers, 'claude-in-chrome': chromeBridgeConfig(exe, rest) } } };
+    return;
+  }
   // control_response to a tracked approval:
   //  • if we already answered it from Telegram, this is the extension's abort-ack to
   //    our control_cancel_request → DROP it so the engine isn't double-answered.

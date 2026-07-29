@@ -15,9 +15,9 @@
 //     full conversation. A resume is NEVER offered/spawned while the original
 //     process is still alive (PID liveness), so we never double-write one .jsonl.
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename, isAbsolute } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync, copyFileSync } from 'node:fs';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
@@ -38,6 +38,9 @@ const OWNER = String(process.env.HUB_OWNER_ID || '');
 const CHAT = String(process.env.HUB_CHAT_ID || OWNER);
 const PORT = Number(process.env.HUB_PORT || 8799);
 const IPC_TOKEN = process.env.HUB_TOKEN || 'dev';
+// Bot API endpoint. Default is Telegram's cloud API (getFile downloads capped at 20 MB).
+// Point at a self-hosted local Bot API server to lift that to 2 GB and get files on disk.
+const API_ROOT = (process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org').replace(/\/+$/, '');
 const SHIM = join(HERE, 'shim.mjs');
 const TMP = process.env.HUB_TMP_DIR || (process.platform === 'win32'
   ? 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions'
@@ -60,7 +63,7 @@ try {
   writeFileSync(join(HUB_CFG_DIR, 'hub.json'), JSON.stringify({ port: PORT, token: IPC_TOKEN }));
 } catch (e) { console.error('[hub] discovery config write failed:', e?.message); }
 
-const bot = new Bot(TOKEN);
+const bot = new Bot(TOKEN, { client: { apiRoot: API_ROOT } });
 const sessions = new Map();    // sessionId -> { conn, cwd, label }  (LIVE only — has a socket)
 const order = [];
 const pendingPerm = new Map(); // request_id -> sessionId
@@ -203,7 +206,7 @@ function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.c
 
 // ── Telegram rendering ───────────────────────────────────────────────────────
 // Sessions (panel & CLI) emit Markdown: **bold**, `code`, ```fences```, [t](url),
-// # headers, - bullets. Render it as Telegram HTML — far more forgiving than
+// # headers, - bullets, > quotes. Render it as Telegram HTML — far more forgiving than
 // MarkdownV2 (only < > & need escaping). sendTg falls back to plain text if
 // Telegram still rejects the entities, so a message is never lost; long messages
 // are split under Telegram's 4096-char limit.
@@ -226,6 +229,18 @@ function mdToTgHtml(src) {
     t = t.replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>').replace(/__([^\n]+?)__/g, '<b>$1</b>');     // bold
     t = t.replace(/^#{1,6}\s*(.+)$/gm, '<b>$1</b>');                                              // headers
     t = t.replace(/^(\s*)[-*]\s+/gm, '$1• ');                                                     // bullets
+    // blockquotes: consecutive "> " lines (already escaped to &gt;) -> one <blockquote>
+    if (/^&gt;/m.test(t)) {
+      const lines = t.split('\n'); const out = []; let q = null;
+      for (const ln of lines) {
+        const m = ln.match(/^&gt;\s?(.*)$/);
+        if (m) { (q ??= []).push(m[1]); continue; }
+        if (q) { out.push(`<blockquote>${q.join('\n')}</blockquote>`); q = null; }
+        out.push(ln);
+      }
+      if (q) out.push(`<blockquote>${q.join('\n')}</blockquote>`);
+      t = out.join('\n');
+    }
     return t;
   }).join('');
 }
@@ -276,7 +291,7 @@ const isStream = id => sessions.get(id)?.kind === 'stream';
 // Inline command pad for ONE stream session, opened via the ⚙ пульт keyboard button.
 function controlPad(id) {
   return new InlineKeyboard()
-    .text('🧮 контекст', `cmd:${id}:context`).text('🌐 remote', `cmd:${id}:rc`).row()
+    .text('🧮 контекст', `cmd:${id}:context`).text('🌐 remote', `cmd:${id}:rc`).text('🧭 браузер', `cmd:${id}:browser`).row()
     .text('⏳ лимит', `cmd:${id}:limits`).text('🗜 compact', `cmd:${id}:compact`).text('⏹ прервать', `cmd:${id}:interrupt`).row();
 }
 // ── AskUserQuestion cards ────────────────────────────────────────────────────
@@ -349,6 +364,40 @@ async function routeTo(ctx, id, body) {
   if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return; }
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
 }
+
+// Which session a message targets: a reply to a tracked bot message → that session
+// (the reply may be to an OLD message, not the latest), else the active session.
+function targetSession(ctx) {
+  const rid = ctx.message?.reply_to_message?.message_id;
+  if (rid && outMsgToSession.has(rid)) return outMsgToSession.get(rid);
+  return active;
+}
+// When a message quotes another, prefix its content as a `> …` block so the session
+// sees WHICH message was answered — needed because a reply can target any past message,
+// not just the last. Works for replies to the bot, to yourself, or to anyone in a group.
+function quotePrefix(ctx) {
+  const r = ctx.message?.reply_to_message;
+  const q = String(r?.text || r?.caption || '').trim();
+  if (!q) return '';
+  const capped = q.length > 500 ? q.slice(0, 500) + '…' : q;
+  return capped.split('\n').map(l => '> ' + l).join('\n') + '\n\n';
+}
+
+// ── incoming files → <cwd>/.tg-inbox/ ────────────────────────────────────────
+const humanSize = n => (!n ? '?' : n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
+function inboxName(msg) {
+  const uid = f => f?.file_unique_id || 'file';
+  if (msg.document?.file_name) return basename(msg.document.file_name);
+  if (msg.audio) return basename(msg.audio.file_name || `audio_${uid(msg.audio)}.mp3`);
+  if (msg.video) return basename(msg.video.file_name || `video_${uid(msg.video)}.mp4`);
+  if (msg.animation) return basename(msg.animation.file_name || `anim_${uid(msg.animation)}.mp4`);
+  if (msg.photo) return `photo_${uid(msg.photo[msg.photo.length - 1])}.jpg`;
+  if (msg.voice) return `voice_${uid(msg.voice)}.ogg`;
+  if (msg.video_note) return `videonote_${uid(msg.video_note)}.mp4`;
+  if (msg.sticker) return `sticker_${uid(msg.sticker)}.webp`;
+  return `file_${uid(msg.document)}`;
+}
+const fileMime = msg => msg.document?.mime_type || msg.audio?.mime_type || msg.video?.mime_type || msg.voice?.mime_type || msg.animation?.mime_type || '';
 
 // Spawn a session in cwd. Identity is the claude conversation UUID: a NEW session
 // gets a hub-generated UUID used as BOTH --session-id and our registry/shim key,
@@ -678,7 +727,7 @@ bot.command('new', async ctx => {
 
 // Panel/stream commands → forwarded to the active control-capable session, which
 // runs them over the stream-json control-protocol and replies via the hub.
-for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt']) {
+for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt', 'browser']) {
   bot.command(name, async ctx => {
     if (!owns(ctx)) return;
     const id = active;
@@ -719,7 +768,7 @@ bot.on('callback_query:data', async ctx => {
     return;
   }
 
-  if ((m = /^cmd:(.+):(context|rc|limits|compact|interrupt)$/.exec(data))) {
+  if ((m = /^cmd:(.+):(context|rc|limits|compact|interrupt|browser)$/.exec(data))) {
     const [, id, name] = m;
     if (!sessions.has(id)) { await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {}); return; }
     if (!isStream(id)) { await ctx.answerCallbackQuery({ text: 'только для stream-сессий' }).catch(() => {}); return; }
@@ -867,8 +916,11 @@ bot.on('message:text', async ctx => {
     return;
   }
 
+  // reply to a bot message -> its session, WITH the quoted text (the reply may target
+  // an old message, so the session needs to see which one).
+  const quoted = quotePrefix(ctx);
   const rid = ctx.message.reply_to_message?.message_id;
-  if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), text); return; }
+  if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), quoted + text); return; }
 
   // bare label tap from the keyboard (optional trailing ✓) -> switch active
   const bare = text.replace(/\s*✓\s*$/, '').trim();
@@ -880,7 +932,44 @@ bot.on('message:text', async ctx => {
   if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); } else { await ctx.reply(`no session "${mm[1]}" — see /sessions`); } return; }
 
   if (!active) { await ctx.reply('no active session — /projects to resume one, or start the launcher'); return; }
-  await routeTo(ctx, active, text);
+  // reply to a non-bot message (yours, someone else's, or a bot msg forgotten after a
+  // restart) still carries its quote to the active session.
+  await routeTo(ctx, active, quoted + text);
+});
+
+// Any attachment (document/photo/voice/video/…) -> download into the target session's
+// .tg-inbox/ and inject a turn pointing at it, so Claude can Read it by relative path.
+bot.on(':file', async ctx => {
+  if (!owns(ctx)) return;
+  const id = targetSession(ctx);
+  if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии — /projects, чтобы поднять'); return; }
+  const cwd = sessions.get(id).cwd;
+
+  let file;
+  try { file = await ctx.getFile(); }
+  catch (e) {
+    const msg = e?.description || e?.message || String(e);
+    await ctx.reply(/too big/i.test(msg) ? '⚠️ файл больше 20 МБ — Bot API не может его скачать.' : `⚠️ не удалось получить файл: ${msg}`);
+    return;
+  }
+  const name = inboxName(ctx.message).replace(/[\r\n\t]/g, '_');
+  const dir = join(cwd, '.tg-inbox'), dest = join(dir, name);
+  try {
+    mkdirSync(dir, { recursive: true });
+    if (isAbsolute(file.file_path)) copyFileSync(file.file_path, dest);   // local Bot API server: file already on disk
+    else {
+      const res = await fetch(`${API_ROOT}/file/bot${TOKEN}/${file.file_path}`);
+      if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+      writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+    }
+  } catch (e) {
+    await ctx.reply(`⚠️ не смог сохранить файл (${humanSize(file.file_size)}): ${e?.message || e}`);
+    return;
+  }
+  const mime = fileMime(ctx.message);
+  const info = `[файл: .tg-inbox/${name} (${humanSize(file.file_size)}${mime ? ', ' + mime : ''})]`;
+  const cap = String(ctx.message.caption || '').trim();
+  await routeTo(ctx, id, quotePrefix(ctx) + info + (cap ? '\n' + cap : ''));
 });
 
 bot.catch(err => console.error('[hub] bot error', err?.error));

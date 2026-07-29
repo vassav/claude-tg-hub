@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { createCommands } from './commands.mjs';
+import { createCommands, chromeBridgeConfig, BROWSER_MENTION } from './commands.mjs';
 import { askOf, buildAnswers } from './ask.mjs';
 
 // ── config / logging ─────────────────────────────────────────────────────────
@@ -61,7 +61,9 @@ function onHub(m) {
   log('HUB->', m);
   if (m.t === 'inbound') {
     boundChatId = String(m.meta?.chat_id || boundChatId || OWNER || '');
-    injectUser(String(m.content ?? ''));
+    const text = String(m.content ?? '');
+    if (BROWSER_MENTION.test(text)) cmds.injectBrowser(text, boundChatId);
+    else injectUser(text);
   } else if (m.t === 'permission_decision') {
     resolveApproval(m.request_id, m.behavior, m.answers, m.message, m.suggestion);
   } else if (m.t === 'command') {
@@ -82,7 +84,10 @@ function injectUser(text) {
 }
 
 // shared control-protocol command logic (also used by the panel interposer)
-const cmds = createCommands({ toEngine, sendHub, sessionId: SESSION_ID, owner: OWNER, injectUser });
+let browserOn = false;   // no panel here — the hub is the only writer of the dynamic set
+const cmds = createCommands({ toEngine, sendHub, sessionId: SESSION_ID, owner: OWNER, injectUser,
+  browser: { bridge: () => chromeBridgeConfig(exe, rest), servers: () => ({}),
+    enabled: () => browserOn, setEnabled: v => { browserOn = v; } } });
 
 // ── approvals (this client is the SOLE approver — always route to Telegram) ───
 const approvals = new Map();    // realId -> { synthId, input, toolUseId, resolved }
