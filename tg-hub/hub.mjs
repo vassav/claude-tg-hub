@@ -69,7 +69,7 @@ const bot = new Bot(TOKEN, { client: { apiRoot: API_ROOT } });
 const sessions = new Map();    // sessionId -> { conn, cwd, label }  (LIVE only — has a socket)
 const order = [];
 const pendingPerm = new Map(); // request_id -> sessionId
-const permMsg = new Map();      // request_id -> approval-card message_id (home chat), for clearing buttons
+const permMsg = new Map();      // request_id -> { mid, chat } of the approval/ask card, for clearing buttons
 const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
 const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user } of the message that most recently drove it
@@ -605,23 +605,26 @@ net.createServer(sock => {
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
-          askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0 });
+          // The card belongs where the question came from: a person asking from a group
+          // must be able to answer it there. Approvals below stay in CHAT (owner's DM).
+          const askChat = askChatFor(lastInbound.get(m.sessionId), CHAT);
+          askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0, chatId: askChat });
           const c = askCard(m.request_id);
-          sendTg(CHAT, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+          sendTg(askChat, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, { mid: sent.message_id, chat: askChat }); });
         } else {                                       // channels (or any other tool): Allow/Deny as before
           const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`).row();
           // …plus the engine's own "don't ask again" offers (stream sessions only)
           (m.suggestions || []).slice(0, 4).forEach((s, i) => kb.text(btnLabel(suggestLabel(s)), `psug:${m.request_id}:${i}`).row());
           const pv = (m.input_preview && askDigest(m.tool_name, m.input_preview)) || m.input_preview;
           const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (pv ? `\n${pv}` : '');
-          sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, sent.message_id); });
+          sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, { mid: sent.message_id, chat: CHAT }); });
         }
       } else if (m.t === 'approval_cancel') {
         // The session answered this approval elsewhere (e.g. in the VSCode panel) —
         // drop the now-stale Telegram buttons.
         pendingPerm.delete(m.request_id); askState.delete(m.request_id);
-        const mid = permMsg.get(m.request_id); permMsg.delete(m.request_id);
-        if (mid) bot.api.editMessageText(CHAT, mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
+        const card = permMsg.get(m.request_id); permMsg.delete(m.request_id);
+        if (card) bot.api.editMessageText(card.chat, card.mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
       } else if (m.t === 'inject') {
         // External, programmatic inbound (a local consumer process, NOT a human in
         // Telegram). Authenticated like register; target is a live session's id or
@@ -857,7 +860,7 @@ bot.on('callback_query:data', async ctx => {
     askState.delete(rid); pendingPerm.delete(rid); permMsg.delete(rid);
     sendToSession(st.sessionId, { t: 'permission_decision', request_id: rid, behavior: 'deny', message: 'User cancelled the question in Telegram.' });
     await ctx.answerCallbackQuery({ text: 'Отменено' }).catch(() => {});
-    await editTg(CHAT, ctx.callbackQuery.message.message_id, `❓ [${labelOf(st.sessionId)}] — ❌ отменено`);
+    await editTg(st.chatId, ctx.callbackQuery.message.message_id, `❓ [${labelOf(st.sessionId)}] — ❌ отменено`);
     return;
   }
 
@@ -879,7 +882,7 @@ bot.on('callback_query:data', async ctx => {
         const k = sel.indexOf(oi); if (k >= 0) sel.splice(k, 1); else sel.push(oi);
         await ctx.answerCallbackQuery().catch(() => {});
         const c = askCard(rid);
-        await editTg(CHAT, mid, c.text, { reply_markup: c.kb });
+        await editTg(st.chatId, mid, c.text, { reply_markup: c.kb });
         return;
       }
       st.picks[qi] = [oi];                                  // single select commits on tap
@@ -887,12 +890,12 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery().catch(() => {});
     if (++st.cur < st.qs.questions.length) {                // next question, SAME card
       const c = askCard(rid);
-      await editTg(CHAT, mid, c.text, { reply_markup: c.kb });
+      await editTg(st.chatId, mid, c.text, { reply_markup: c.kb });
       return;
     }
     askState.delete(rid); pendingPerm.delete(rid); permMsg.delete(rid);
     sendToSession(st.sessionId, { t: 'permission_decision', request_id: rid, behavior: 'allow', answers: st.picks });
-    await editTg(CHAT, mid, askSummary(st));
+    await editTg(st.chatId, mid, askSummary(st));
     return;
   }
 
