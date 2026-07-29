@@ -25,7 +25,7 @@ import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
-import { replyExtra, askChatFor } from './chat-target.mjs';
+import { replyExtra, askChatFor, nextInbound } from './chat-target.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -366,9 +366,10 @@ async function routeTo(ctx, id, body) {
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
   if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return; }
-  // A session runs one turn at a time, so "who wrote to it last" is who its next
-  // output answers — that's what we attribute replies and ask cards to.
-  lastInbound.set(id, { chat_id: meta.chat_id, message_id: meta.message_id, user: meta.user });
+  // A session runs one turn at a time, but a SECOND person can write in before the
+  // first is answered — nextInbound() tracks that and marks the entry ambiguous so
+  // we quote nobody rather than the wrong person (see chat-target.mjs).
+  lastInbound.set(id, nextInbound(lastInbound.get(id), meta));
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
 }
 
@@ -598,7 +599,9 @@ net.createServer(sock => {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
         const to = m.chat_id || CHAT;
-        sendTg(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, replyExtra(lastInbound.get(m.sessionId), to));
+        const last = lastInbound.get(m.sessionId);
+        sendTg(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
+        if (last) last.pending = false;  // answered — the next writer isn't competing with anyone
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
@@ -670,6 +673,7 @@ net.createServer(sock => {
     if (sessions.get(sid)?.conn !== sock) return; // superseded by a newer registration — ignore this orphan
     const label = labelOf(sid);
     sessions.delete(sid);
+    lastInbound.delete(sid); // a resume reuses this id — don't quote a message from its previous life
     for (const [rid, st] of askState) if (st.sessionId === sid) askState.delete(rid); // its cards can never resolve now
     const i = order.indexOf(sid); if (i >= 0) order.splice(i, 1);
     if (active === sid) active = order[order.length - 1] || null;

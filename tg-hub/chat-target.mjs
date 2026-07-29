@@ -18,3 +18,12 @@ export function replyExtra(last, chatId) {
 // An AskUserQuestion card belongs in the chat that asked; fall back to the home chat
 // (a session started from the panel or by an external `start` has no inbound yet).
 export const askChatFor = (last, homeChat) => last?.chat_id || homeChat;
+
+// Attribution state for a session's next answer. `pending` means the recorded message
+// hasn't been answered yet; a SECOND person writing while one is pending makes the next
+// answer's owner unknowable, so we mark it ambiguous and later quote nobody rather than
+// point at the wrong person. Ambiguity survives until a fresh, uncontested message arrives.
+export function nextInbound(prev, meta) {
+  const contested = !!prev?.pending && (prev.ambiguous || String(prev.user_id) !== String(meta.user_id));
+  return { chat_id: meta.chat_id, message_id: meta.message_id, user: meta.user, user_id: meta.user_id, pending: true, ambiguous: contested };
+}
