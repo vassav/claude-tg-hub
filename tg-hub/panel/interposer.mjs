@@ -77,6 +77,9 @@ const { port: HUB_PORT, token: HUB_TOKEN } = discover();
 
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
 let sessionId = null, cwd = process.cwd(), boundChatId = '';
+// Token counter for the hub's "Thinking…" bubble. usage.output_tokens is per API CALL, and a
+// turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
+let turnTokens = 0, lastStatusAt = 0;
 // browser MCP co-ownership with the panel: base = the panel's last dynamic-server
 // map (chrome-less), flags track who enabled chrome and whether it is on now.
 let hostServers = {}, hostHadChrome = false, browserOn = false;
@@ -229,6 +232,8 @@ function outForwarder() {
   };
 }
 function onOut(o) {                                   // engine -> extension
+  // new turn → new counter
+  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; }
   // identity: learn session_id ASAP — the first system hook (hook_started) already
   // carries it — and register immediately, so the panel shows up in /sessions even
   // before its first turn (system/init only fires once a turn starts). cwd defaults
@@ -259,6 +264,12 @@ function onOut(o) {                                   // engine -> extension
   if (o.type === 'assistant' && o.message?.content && boundChatId) {
     for (const b of o.message.content) {
       if (b.type === 'text' && b.text?.trim()) sendHub({ t: 'reply', sessionId, chat_id: boundChatId, text: b.text });
+    }
+    const out = Number(o.message?.usage?.output_tokens || 0);
+    if (out) {
+      turnTokens += out;
+      const now = Date.now();
+      if (now - lastStatusAt > 2000) { lastStatusAt = now; sendHub({ t: 'status', sessionId, tokens: turnTokens }); }
     }
     return;
   }

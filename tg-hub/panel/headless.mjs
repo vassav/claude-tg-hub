@@ -34,6 +34,9 @@ function safeStr(v) { try { return typeof v === 'string' ? v : JSON.stringify(v)
 const args = process.argv.slice(2);            // [claudeExe, ...claudeArgs]
 const exe = args[0], rest = args.slice(1);
 let cwd = process.cwd(), boundChatId = '';
+// Token counter for the hub's "Thinking…" bubble. usage.output_tokens is per API CALL, and a
+// turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
+let turnTokens = 0, lastStatusAt = 0;
 
 // ── hub TCP client (mirror of shim/interposer) ───────────────────────────────
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
@@ -134,6 +137,8 @@ function resolveApproval(synthId, behavior, picks, denyMsg, sugIdx) {
 
 // ── engine output handler ─────────────────────────────────────────────────────
 function onEngine(o) {
+  // new turn → new counter
+  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; }
   // my own control-command responses (context/rc) — formatted + sent to Telegram
   if (o.type === 'control_response') {
     if (cmds.onControlResponse(o)) return;
@@ -147,6 +152,12 @@ function onEngine(o) {
   if (o.type === 'assistant' && o.message?.content) {
     const to = boundChatId || OWNER;
     if (to) for (const b of o.message.content) if (b.type === 'text' && b.text?.trim()) sendHub({ t: 'reply', sessionId: SESSION_ID, chat_id: to, text: b.text });
+    const out = Number(o.message?.usage?.output_tokens || 0);
+    if (out) {
+      turnTokens += out;
+      const now = Date.now();
+      if (now - lastStatusAt > 2000) { lastStatusAt = now; sendHub({ t: 'status', sessionId: SESSION_ID, tokens: turnTokens }); }
+    }
     return;
   }
 }

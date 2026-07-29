@@ -644,6 +644,9 @@ net.createServer(sock => {
         if (first) { pendingFirstMsg.delete(sid); if (sendToSession(sid, { t: 'inbound', content: first.content, meta: first.meta })) armAutoName(sid, first.content); }
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
+      } else if (m.t === 'status') {
+        const e = thinking.get(m.sessionId);      // only meaningful while a bubble is up
+        if (e) { e.tokens = Number(m.tokens || 0); paintThinking(m.sessionId); }
       } else if (m.t === 'reply') {
         stopThinking(m.sessionId);   // the answer itself replaces the draft
         const to = m.chat_id || CHAT;
