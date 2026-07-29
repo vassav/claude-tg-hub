@@ -25,6 +25,7 @@ import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
+import { replyExtra, askChatFor } from './chat-target.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -71,6 +72,7 @@ const pendingPerm = new Map(); // request_id -> sessionId
 const permMsg = new Map();      // request_id -> approval-card message_id (home chat), for clearing buttons
 const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
+const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user } of the message that most recently drove it
 let active = null;
 const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
@@ -256,11 +258,12 @@ function chunkText(s, n = 4000) {
   if (cur) out.push(cur);
   return out;
 }
-async function sendTg(chatId, text, sid, extra = {}) {
+async function sendTg(chatId, text, sid, extra = {}, firstExtra = {}) {
   const parts = chunkText(String(text ?? ''));
   let last = null;
   for (let i = 0; i < parts.length; i++) {
-    const opts = { link_preview_options: { is_disabled: true }, ...(i === parts.length - 1 ? extra : {}) }; // keyboard only on last chunk
+    // keyboard only on the last chunk; reply-quote only on the first
+    const opts = { link_preview_options: { is_disabled: true }, ...(i === 0 ? firstExtra : {}), ...(i === parts.length - 1 ? extra : {}) };
     let sent = null;
     try { sent = await bot.api.sendMessage(chatId, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
     catch { try { sent = await bot.api.sendMessage(chatId, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
@@ -363,6 +366,9 @@ async function routeTo(ctx, id, body) {
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
   if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return; }
+  // A session runs one turn at a time, so "who wrote to it last" is who its next
+  // output answers — that's what we attribute replies and ask cards to.
+  lastInbound.set(id, { chat_id: meta.chat_id, message_id: meta.message_id, user: meta.user });
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
 }
 
@@ -591,7 +597,8 @@ net.createServer(sock => {
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
       } else if (m.t === 'reply') {
-        sendTg(m.chat_id || CHAT, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId);
+        const to = m.chat_id || CHAT;
+        sendTg(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, replyExtra(lastInbound.get(m.sessionId), to));
       } else if (m.t === 'permission_request') {
         pendingPerm.set(m.request_id, m.sessionId);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
