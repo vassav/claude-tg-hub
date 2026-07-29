@@ -24,7 +24,10 @@ channels-хаб (см. Статус). *(Исходная стратегия fork
 **авто-именование** сессий моделью (`set_title`, иначе слаг первого запроса), **подключение
 браузера из TG** (кнопка `🧭 браузер` в пульте / `/browser` / `@browser` в тексте → регистрация
 claude-in-chrome MCP через `control_request{mcp_set_servers}`; мост `claude --claude-in-chrome-mcp`
-автономен, VS Code не нужен — см. [`docs/specs/2026-07-27-tg-browser-command.md`](docs/specs/2026-07-27-tg-browser-command.md)).
+автономен, VS Code не нужен — см. [`docs/specs/2026-07-27-tg-browser-command.md`](docs/specs/2026-07-27-tg-browser-command.md)),
+**многопользовательский доступ** (список `access.json` + `/allow`/`/deny`/`/who`: люди из
+списка работают с ботом в групповых чатах, вывод и аппрувы остаются в личке владельца —
+см. [`docs/specs/2026-07-29-group-allowlist.md`](docs/specs/2026-07-29-group-allowlist.md)).
 
 Реализован и **режим VSCode-панели** — мост через `claudeProcessWrapper`-stdio-интерпозер
 ([`tg-hub/panel/`](tg-hub/panel/)): зеркало ответов панели в Telegram, инжект сообщений из TG
@@ -37,7 +40,7 @@ claude-in-chrome MCP через `control_request{mcp_set_servers}`; мост `cl
 - [`docs/specs/2026-06-11-vscode-panel-bridge.md`](docs/specs/2026-06-11-vscode-panel-bridge.md) — проверенный stream-json панели + дизайн моста.
 
 Дальше (не сделано): TS-пакет вместо `.mjs`; кроссплатформенные пути (`TMP`/`CLAUDE_BIN`/пути
-wrapper'а → env, сейчас захардкожены под Windows); многопользовательский доступ.
+wrapper'а → env, сейчас захардкожены под Windows).
 
 Историческое (исходный дизайн до перехода на channels): [`docs/specs/2026-06-05-claude-tg-hub-design.md`](docs/specs/2026-06-05-claude-tg-hub-design.md), [`docs/research/2026-06-05-panel-engine-and-wrapper.md`](docs/research/2026-06-05-panel-engine-and-wrapper.md), [`docs/research/2026-06-05-stack-and-existing-tools.md`](docs/research/2026-06-05-stack-and-existing-tools.md).
 
