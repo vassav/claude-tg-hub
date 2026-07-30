@@ -27,7 +27,7 @@ import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
 import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
-import { createActive } from './routing.mjs';
+import { createActive, createPending } from './routing.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -78,6 +78,7 @@ const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, use
 const thinking = new Map();   // sessionId -> { chatId, draftId, startedAt, tokens, timer } — live "Thinking…" draft
 let draftSeq = 0;             // draft_id must be a non-zero Integer; a NEW one per turn, since same-id edits animate
 const active = createActive();                 // chatId -> sessionId; no global pointer
+const pending = createPending();   // chatId -> text written before the chat had an active session
 const activeIn = ctx => active.get(ctx.chat?.id);
 const pendingActivate = new Map(); // sessionId -> chatId that asked for it (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
@@ -875,6 +876,8 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: `active: ${labelOf(id)}` }).catch(() => {});
       await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
       await notify(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(CHAT) });
+      const held = pending.take(ctx.chat.id);
+      if (held) await routeTo(ctx, id, held);   // deliver what they wrote before picking
     } else await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {});
     return;
   }
@@ -1058,7 +1061,13 @@ bot.on('message:text', async ctx => {
   if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); } else { await ctx.reply(`no session "${mm[1]}" — see /sessions`); } return; }
 
   const cur = activeIn(ctx);
-  if (!cur) { await ctx.reply('no active session — /projects to resume one, or start the launcher'); return; }
+  if (!cur) {
+    // Don't drop what they wrote: hold it and let them pick a session — the tap delivers it.
+    if (!order.length) { await ctx.reply('нет живых сессий — /projects, чтобы поднять'); return; }
+    pending.put(ctx.chat.id, quoted + text);
+    await ctx.reply('в этом чате нет активной сессии — выбери, куда отправить:', { reply_markup: sessionInline(ctx.chat.id) });
+    return;
+  }
   // reply to a non-bot message (yours, someone else's, or a bot msg forgotten after a
   // restart) still carries its quote to the active session.
   await routeTo(ctx, cur, quoted + text);
