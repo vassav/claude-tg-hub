@@ -645,6 +645,19 @@ net.createServer(sock => {
         const wantChat = pendingActivate.get(sid);
         if (wantChat !== undefined) { active.set(wantChat, sid); pendingActivate.delete(sid); }
         else if (!active.get(CHAT)) active.set(CHAT, sid);   // first session ever → home chat
+        // The picker offered in an empty chat also lists ⏸ resumable sessions, and tapping one
+        // goes through startSession — never through the switch: handler. Deliver here, where a
+        // session becomes a chat's active one no matter how it got up: new, resumed or re-adopted.
+        // No ctx and no original message_id, so this goes out like pendingFirstMsg does, and the
+        // answer will carry no reply-quote.
+        if (wantChat !== undefined) {
+          const held = pending.take(wantChat);
+          const meta = { chat_id: String(wantChat), message_id: '', user: 'hub', user_id: '', ts: new Date().toISOString() };
+          if (held && sendToSession(sid, { t: 'inbound', content: held, meta })) {
+            lastInbound.set(sid, nextInbound(lastInbound.get(sid), meta));
+            armAutoName(sid, held);
+          }
+        }
         console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${labelOf(sid)} = ${sid} (cwd ${m.cwd})`);
         notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${labelOf(sid)}\ncwd: ${m.cwd}\nactive: ${labelOf(active.get(CHAT))}`, { reply_markup: replyKeyboard(CHAT) });
         // External {t:'start',content}: deliver the queued first message now that it's live.
