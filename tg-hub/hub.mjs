@@ -416,13 +416,14 @@ async function routeTo(ctx, id, body) {
     chat_id: String(ctx.chat.id), message_id: String(ctx.message.message_id),
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
-  if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return; }
+  if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return false; }
   // A session runs one turn at a time, but a SECOND person can write in before the
   // first is answered — nextInbound() tracks that and marks the entry ambiguous so
   // we quote nobody rather than the wrong person (see chat-target.mjs).
   lastInbound.set(id, nextInbound(lastInbound.get(id), meta));
   startThinking(id, meta.chat_id);   // silence → a live draft while the session works
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
+  return true;
 }
 
 // Which session a message targets: a reply to a tracked bot message → that session
@@ -877,7 +878,7 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
       await notify(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(CHAT) });
       const held = pending.take(ctx.chat.id);
-      if (held) await routeTo(ctx, id, held);   // deliver what they wrote before picking
+      if (held) { if (!await routeTo(ctx, id, held)) pending.put(ctx.chat.id, held); }   // re-hold on delivery failure
     } else await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {});
     return;
   }
@@ -1064,8 +1065,8 @@ bot.on('message:text', async ctx => {
   if (!cur) {
     // Don't drop what they wrote: hold it and let them pick a session — the tap delivers it.
     if (!order.length) { await ctx.reply('нет живых сессий — /projects, чтобы поднять'); return; }
-    pending.put(ctx.chat.id, quoted + text);
     await ctx.reply('в этом чате нет активной сессии — выбери, куда отправить:', { reply_markup: sessionInline(ctx.chat.id) });
+    pending.put(ctx.chat.id, quoted + text);
     return;
   }
   // reply to a non-bot message (yours, someone else's, or a bot msg forgotten after a
