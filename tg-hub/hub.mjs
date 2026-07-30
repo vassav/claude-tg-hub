@@ -27,7 +27,7 @@ import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
 import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
-import { createActive, createPending } from './routing.mjs';
+import { createActive, createPending, sessionButton, stripActiveMark } from './routing.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -160,6 +160,7 @@ function upsertRegistry(id, patch) { registry.set(id, { ...(registry.get(id) || 
 function resumableEntries() { return [...registry.values()].filter(e => e.managed && e.status === 'dead' && !sessions.has(e.id)); }
 
 const labelOf = id => sessions.get(id)?.label || registry.get(id)?.label || id;
+const btnOf = id => sessionButton({ label: labelOf(id), cwd: sessions.get(id)?.cwd });
 
 // Labels keep unicode letters/digits (so a Russian request doesn't collapse to
 // 'session'); everything else becomes '-'. Trimmed, capped at 40 chars.
@@ -335,7 +336,7 @@ function stopThinking(id) {
 function replyKeyboard(chatId) {
   const k = new Keyboard();
   const cur = active.get(chatId);
-  if (order.length) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
+  if (order.length) { for (const id of order) k.text(btnOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
   k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
 }
@@ -407,7 +408,7 @@ function askDigest(tool, preview) {
 function sessionInline(chatId) {
   const k = new InlineKeyboard();
   const cur = active.get(chatId);
-  for (const id of order) { k.text((id === cur ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
+  for (const id of order) { k.text((id === cur ? '● ' : '') + btnOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
   return k;
 }
@@ -1052,9 +1053,11 @@ bot.on('message:text', async ctx => {
   const rid = ctx.message.reply_to_message?.message_id;
   if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), quoted + text); return; }
 
-  // bare label tap from the keyboard (optional trailing ✓) -> switch active
-  const bare = text.replace(/\s*✓\s*$/, '').trim();
-  const swId = order.find(x => labelOf(x) === bare);
+  // bare button tap from the keyboard -> switch this chat's active session.
+  // Caption and lookup MUST come from the same function: the bottom keyboard sends plain
+  // text, so a format change on one side without the other silently turns taps into prompts.
+  const bare = stripActiveMark(text);
+  const swId = order.find(x => btnOf(x) === bare);
   if (swId) { active.set(ctx.chat.id, swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
 
   // /to <label> <text> -> one-off send to a specific session without switching
