@@ -7,11 +7,12 @@
 export const isGroup = chatId => String(chatId ?? '').startsWith('-');
 
 // Quote the message that asked, so two people talking in one group can tell whose
-// answer is whose. Only in a group, and only when the answer goes back to the very
-// chat the question came from. allow_sending_without_reply keeps the message from
-// failing if the original was deleted meanwhile.
+// answer is whose. Also works in private chats to point back at the original question.
 export function replyExtra(last, chatId) {
-  if (!last?.message_id || !isGroup(chatId)) return {};
+  // Quote the message that asked, in ANY chat — group or DM. Two conditions remain: we
+  // must know which message it was, and the answer must be going back to the very chat the
+  // question came from (a session can be driven from several chats).
+  if (!last?.message_id) return {};
   if (String(last.chat_id) !== String(chatId)) return {};
   return { reply_parameters: { message_id: Number(last.message_id), allow_sending_without_reply: true } };
 }

@@ -659,7 +659,12 @@ net.createServer(sock => {
         stopThinking(m.sessionId);   // the answer itself replaces the draft
         const to = m.chat_id || CHAT;
         const last = lastInbound.get(m.sessionId);
-        sendMd(to, `[${labelOf(m.sessionId)}]\n${m.text}`, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
+        // Header as a blockquote, ALWAYS, in every chat. The blank line is load-bearing:
+        // rich messages are Markdown, where a single newline does NOT start a new block, so
+        // `[label]\n` merged the header into the answer's first sentence. mdToTgHtml turns the
+        // same `> ` line into <blockquote>, so the fallback path renders it as a quote too.
+        const header = `> ${labelOf(m.sessionId)}\n\n`;
+        sendMd(to, header + m.text, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
         if (last) last.pending = false;  // answered — the next writer isn't competing with anyone
       } else if (m.t === 'permission_request') {
         stopThinking(m.sessionId);

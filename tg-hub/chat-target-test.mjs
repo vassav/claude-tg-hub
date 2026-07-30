@@ -16,10 +16,11 @@ ok('isGroup: отрицательный id = группа, положитель�
 const last = { chat_id: '-100123', message_id: '77', user: 'ivan' };
 assert.deepEqual(replyExtra(last, '-100123'), { reply_parameters: { message_id: 77, allow_sending_without_reply: true } });
 assert.deepEqual(replyExtra(last, '-100999'), {}, 'ответ уходит в другую группу — не цитируем');
-assert.deepEqual(replyExtra(last, '300447655'), {}, 'ответ уходит в личку — не цитируем');
+assert.deepEqual(replyExtra({ chat_id: '300447655', message_id: '9' }, '300447655'),
+  { reply_parameters: { message_id: 9, allow_sending_without_reply: true } }, 'в личке цитируем так же, как в группе');
 assert.deepEqual(replyExtra(undefined, '-100123'), {}, 'нет lastInbound');
 assert.deepEqual(replyExtra({ chat_id: '-100123' }, '-100123'), {}, 'нет message_id');
-ok('replyExtra: цитируем только в своей группе, message_id числом');
+ok('replyExtra: цитируем в своём чате (группа или личка), message_id числом');
 
 assert.equal(askChatFor(last, '300447655'), '-100123');
 assert.equal(askChatFor(undefined, '300447655'), '300447655');
