@@ -101,7 +101,12 @@ function handle(msg) {
         'So for EVERY <channel> message you MUST call `reply` with your answer (even if you also respond locally);',
         'send brief interim `reply`s during long tasks and a final `reply` when done so their phone pings.',
         'If you need input, ask via `reply` and wait for their next <channel> message.',
-        'Right after handling the FIRST <channel> message of a new conversation, also call `set_title` ONCE with',
+        // Naming must NOT depend on the transport. A channels session sees <channel> tags, but a
+        // stream session (VSCode panel / hub-launched headless) is driven by plain injected user
+        // turns — it never sees one, so a <channel>-conditioned trigger never fired there and every
+        // such session fell back to a slug of its first request.
+        'Right after handling the FIRST message of a new conversation — whether it arrived as a <channel>',
+        'message or as an ordinary user turn — also call `set_title` ONCE with',
         "a short (≤40 chars) title summarizing it, in the user's language. Do not announce set_title.",
       ].join(' '),
     }});
