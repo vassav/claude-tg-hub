@@ -40,8 +40,8 @@ const cut = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 // Button caption AND the key we match a tap against — the bottom keyboard sends plain
 // text, so caption and lookup must come from this one function or taps silently break.
 export function sessionButton({ label, cwd }) {
-  const proj = cwd ? basename(String(cwd).replace(/[\\/]+$/, '')) : '';
-  const name = cut(String(label ?? ''), 22);
+  const proj = cwd ? basename(String(cwd).replace(/[\\/]+$/, '')).trim() : '';
+  const name = cut(String(label ?? '').trim(), 22);
   return proj ? `${cut(proj, 14)} · ${name}` : name;
 }
 export const stripActiveMark = text => String(text ?? '').replace(/\s*✓\s*$/, '').trim();

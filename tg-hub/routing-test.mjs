@@ -64,6 +64,7 @@ const live = [
   { id: 'a', label: 'Ревью-PRs', cwd: '/p/teamly' },
   { id: 'b', label: 'Ревью-PRs', cwd: '/p/other' },   // одинаковые метки, разные проекты
   { id: 'c', label: 'Ревью', cwd: '/p/teamly' },      // метка — префикс другой
+  { id: 'd', label: '  Ревью-Фиксы  ', cwd: '  /p/other  ' },  // с пробелами — нормализуется
 ];
 for (const s of live) {
   const shown = sessionButton(s) + ' ✓';
