@@ -27,6 +27,7 @@ import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
 import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
+import { createActive } from './routing.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -76,8 +77,9 @@ const outMsgToSession = new Map();
 const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, user_id, pending, ambiguous } of the message that most recently drove it
 const thinking = new Map();   // sessionId -> { chatId, draftId, startedAt, tokens, timer } — live "Thinking…" draft
 let draftSeq = 0;             // draft_id must be a non-zero Integer; a NEW one per turn, since same-id edits animate
-let active = null;
-const pendingActivate = new Set(); // ids to make active as soon as they register (new/resume flow)
+const active = createActive();                 // chatId -> sessionId; no global pointer
+const activeIn = ctx => active.get(ctx.chat?.id);
+const pendingActivate = new Map(); // sessionId -> chatId that asked for it (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
 const awaitingTitle = new Set();   // ids whose meaningful name we're awaiting (model set_title, else slug fallback)
 
@@ -329,9 +331,10 @@ function stopThinking(id) {
   thinking.delete(id);
 }
 
-function replyKeyboard() {
+function replyKeyboard(chatId) {
   const k = new Keyboard();
-  if (order.length) { for (const id of order) k.text(labelOf(id) + (id === active ? ' ✓' : '')); k.row(); }
+  const cur = active.get(chatId);
+  if (order.length) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
   k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
 }
@@ -400,9 +403,10 @@ function askDigest(tool, preview) {
   ).join('\n\n') + '\n\n⚠️ Сессия на channels — выбрать вариант отсюда нельзя. Allow пропустит вопрос БЕЗ ответа; лучше Deny и напишите ответ обычным сообщением.';
 }
 
-function sessionInline() {
+function sessionInline(chatId) {
   const k = new InlineKeyboard();
-  for (const id of order) { k.text((id === active ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
+  const cur = active.get(chatId);
+  for (const id of order) { k.text((id === cur ? '● ' : '') + labelOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
   return k;
 }
@@ -425,7 +429,7 @@ async function routeTo(ctx, id, body) {
 function targetSession(ctx) {
   const rid = ctx.message?.reply_to_message?.message_id;
   if (rid && outMsgToSession.has(rid)) return outMsgToSession.get(rid);
-  return active;
+  return activeIn(ctx);
 }
 // When a message quotes another, prefix its content as a `> …` block so the session
 // sees WHICH message was answered — needed because a reply can target any past message,
@@ -460,7 +464,7 @@ const fileMime = msg => msg.document?.mime_type || msg.audio?.mime_type || msg.v
 // Guards prevent double-spawning one conversation. Returns the session id (string)
 // on success, or null if a guard rejected (callers using `if (startSession(...))`
 // still work: a uuid string is truthy, null is falsy).
-function startSession(cwd, { resumeUuid, extraMcpServers, extraAllowedTools } = {}) {
+function startSession(cwd, { resumeUuid, chatId, extraMcpServers, extraAllowedTools } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
   if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return null; }
@@ -470,7 +474,7 @@ function startSession(cwd, { resumeUuid, extraMcpServers, extraAllowedTools } = 
     if (jsonlFresh(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return null; }
     if (liveCwdConflict(id, cwd)) { notify(`can't resume ${id.slice(0, 8)} — another live session is in ${cwd}`); return null; }
   }
-  pendingActivate.add(id);
+  pendingActivate.set(id, String(chatId || CHAT));   // activate it only in the chat that asked
   let child;
   try {
     child = spawnSession({ id, cwd, resumeId: resumeUuid || null, sessionUuid: resumeUuid ? null : id, shimPath: SHIM, tmpDir: TMP, hubPort: PORT, hubToken: IPC_TOKEN, extraMcpServers, extraAllowedTools });
@@ -635,10 +639,11 @@ net.createServer(sock => {
         // resuming an existing conversation) — pull its stored title from disk so it
         // shows its real name instead of just the cwd folder.
         if (!known?.named) { const dt = diskTitle(sid); if (dt) applyName(sid, dt, true); }
-        if (pendingActivate.has(sid)) { active = sid; pendingActivate.delete(sid); }
-        else if (!active) active = sid;
+        const wantChat = pendingActivate.get(sid);
+        if (wantChat !== undefined) { active.set(wantChat, sid); pendingActivate.delete(sid); }
+        else if (!active.get(CHAT)) active.set(CHAT, sid);   // first session ever → home chat
         console.error(`[hub] ${readopt ? 're-adopted' : 'registered'}: ${labelOf(sid)} = ${sid} (cwd ${m.cwd})`);
-        notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${labelOf(sid)}\ncwd: ${m.cwd}\nactive: ${labelOf(active)}`, { reply_markup: replyKeyboard() });
+        notify(`${readopt ? '♻️ re-adopted' : '✅ registered'} ${labelOf(sid)}\ncwd: ${m.cwd}\nactive: ${labelOf(active.get(CHAT))}`, { reply_markup: replyKeyboard(CHAT) });
         // External {t:'start',content}: deliver the queued first message now that it's live.
         const first = pendingFirstMsg.get(sid);
         if (first) { pendingFirstMsg.delete(sid); if (sendToSession(sid, { t: 'inbound', content: first.content, meta: first.meta })) armAutoName(sid, first.content); }
@@ -746,12 +751,12 @@ net.createServer(sock => {
     stopThinking(sid);
     for (const [rid, st] of askState) if (st.sessionId === sid) askState.delete(rid); // its cards can never resolve now
     const i = order.indexOf(sid); if (i >= 0) order.splice(i, 1);
-    if (active === sid) active = order[order.length - 1] || null;
+    active.clearSession(sid);   // no guessing a replacement — the next message would land somewhere random
     // Decide the durable fate by whether the claude process is actually gone.
     const e = registry.get(sid);
     let resumable = false;
     if (e?.managed) { resolveFate(e, sid); resumable = e.status === 'dead'; saveRegistry(); }
-    notify(`⚠️ ${label} disconnected${resumable ? ' — resume via /sessions' : ''}`, { reply_markup: replyKeyboard() });
+    notify(`⚠️ ${label} disconnected${resumable ? ' — resume via /sessions' : ''}`, { reply_markup: replyKeyboard(CHAT) });
   });
   sock.on('error', () => {});
 }).listen(PORT, '127.0.0.1', () => console.error(`[hub] IPC on 127.0.0.1:${PORT}`));
@@ -763,7 +768,7 @@ const owns = ctx => access.canUse(
   { userId: ctx.from?.id, chatType: ctx.chat?.type, isBot: ctx.from?.is_bot },
   { owner: OWNER });
 
-bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard() }); });
+bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard(ctx.chat.id) }); });
 
 // Discover a chat's id. Open to everyone in a GROUP (it reveals only the caller's own
 // id and the chat's) — that's how a newcomer can hand the owner their id. In a DM it
@@ -807,11 +812,12 @@ bot.command('who', async ctx => {
 bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
   const resumable = resumableEntries();
-  if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard() }); return; }
-  const live = order.map(id => `${id === active ? '● ' : '○ '}${labelOf(id)} — ${sessions.get(id).cwd}`);
+  if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
+  const cur = active.get(ctx.chat.id);
+  const live = order.map(id => `${id === cur ? '● ' : '○ '}${labelOf(id)} — ${sessions.get(id).cwd}`);
   const dead = resumable.map(e => `⏸ ${e.label} — ${e.cwd} (resumable)`);
-  await ctx.reply([...live, ...dead].join('\n') || 'no live sessions', { reply_markup: sessionInline() });
-  await ctx.reply('switch ↓, resume ⏸, or reply to a session\'s message', { reply_markup: replyKeyboard() });
+  await ctx.reply([...live, ...dead].join('\n') || 'no live sessions', { reply_markup: sessionInline(ctx.chat.id) });
+  await ctx.reply('switch ↓, resume ⏸, or reply to a session\'s message', { reply_markup: replyKeyboard(ctx.chat.id) });
 });
 
 bot.command('projects', async ctx => {
@@ -824,7 +830,7 @@ bot.command('projects', async ctx => {
 bot.command('use', async ctx => {
   if (!owns(ctx)) return;
   const id = order.find(x => labelOf(x) === (ctx.match || '').trim() || x === (ctx.match || '').trim());
-  if (id) { active = id; await ctx.reply(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard() }); } else await ctx.reply('not found');
+  if (id) { active.set(ctx.chat.id, id); await ctx.reply(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); } else await ctx.reply('not found');
 });
 
 bot.command('stop', async ctx => {
@@ -842,7 +848,7 @@ bot.command('new', async ctx => {
   if (!owns(ctx)) return;
   const cwd = (ctx.match || '').trim();
   if (!cwd) { await ctx.reply('usage: /new <project path>\n(or /projects → ➕ New session here)'); return; }
-  if (startSession(cwd)) await ctx.reply(`➕ starting new session in ${cwd}…`);
+  if (startSession(cwd, { chatId: ctx.chat.id })) await ctx.reply(`➕ starting new session in ${cwd}…`);
 });
 
 // Panel/stream commands → forwarded to the active control-capable session, which
@@ -850,7 +856,7 @@ bot.command('new', async ctx => {
 for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt', 'browser']) {
   bot.command(name, async ctx => {
     if (!owns(ctx)) return;
-    const id = active;
+    const id = activeIn(ctx);
     if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
     if (!isStream(id)) { await ctx.reply('⚙️ доступно только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
     sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
@@ -865,10 +871,10 @@ bot.on('callback_query:data', async ctx => {
   if ((m = /^switch:(.+)$/.exec(data))) {
     const id = m[1];
     if (sessions.has(id)) {
-      active = id;
+      active.set(ctx.chat.id, id);
       await ctx.answerCallbackQuery({ text: `active: ${labelOf(id)}` }).catch(() => {});
-      await ctx.editMessageReplyMarkup({ reply_markup: sessionInline() }).catch(() => {});
-      await notify(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard() });
+      await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
+      await notify(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(CHAT) });
     } else await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {});
     return;
   }
@@ -884,7 +890,7 @@ bot.on('callback_query:data', async ctx => {
     const id = m[1];
     registry.delete(id); saveRegistry();
     await ctx.answerCallbackQuery({ text: 'forgotten' }).catch(() => {});
-    await ctx.editMessageReplyMarkup({ reply_markup: sessionInline() }).catch(() => {});
+    await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
     return;
   }
 
@@ -998,7 +1004,7 @@ bot.on('callback_query:data', async ctx => {
     if (!cwd) { await ctx.answerCallbackQuery({ text: 'no cwd' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(cwd, { resumeUuid: id }); // startSession enforces liveness/history guards
+    startSession(cwd, { resumeUuid: id, chatId: ctx.chat.id }); // startSession enforces liveness/history guards
     return;
   }
 
@@ -1008,7 +1014,7 @@ bot.on('callback_query:data', async ctx => {
     if (!e?.cwd) { await ctx.answerCallbackQuery({ text: 'unknown session' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(e.cwd, { resumeUuid: id });
+    startSession(e.cwd, { resumeUuid: id, chatId: ctx.chat.id });
     return;
   }
 
@@ -1016,7 +1022,7 @@ bot.on('callback_query:data', async ctx => {
     const p = lastProjects[Number(m[1])];
     if (!p?.cwd) { await ctx.answerCallbackQuery({ text: 'open /projects again' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'starting…' }).catch(() => {});
-    startSession(p.cwd);
+    startSession(p.cwd, { chatId: ctx.chat.id });
     return;
   }
 
@@ -1029,7 +1035,7 @@ bot.on('message:text', async ctx => {
 
   // ⚙ пульт keyboard button -> open the inline command pad for the active stream session
   if (text === '⚙ пульт') {
-    const id = active;
+    const id = activeIn(ctx);
     if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
     if (!isStream(id)) { await ctx.reply('⚙️ пульт доступен только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
     await ctx.reply(`⚙ пульт · ${labelOf(id)}`, { reply_markup: controlPad(id) });
@@ -1045,16 +1051,17 @@ bot.on('message:text', async ctx => {
   // bare label tap from the keyboard (optional trailing ✓) -> switch active
   const bare = text.replace(/\s*✓\s*$/, '').trim();
   const swId = order.find(x => labelOf(x) === bare);
-  if (swId) { active = swId; await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard() }); return; }
+  if (swId) { active.set(ctx.chat.id, swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
 
   // /to <label> <text> -> one-off send to a specific session without switching
   const mm = /^\/to\s+(\S+)\s+([\s\S]+)$/.exec(text);
   if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); } else { await ctx.reply(`no session "${mm[1]}" — see /sessions`); } return; }
 
-  if (!active) { await ctx.reply('no active session — /projects to resume one, or start the launcher'); return; }
+  const cur = activeIn(ctx);
+  if (!cur) { await ctx.reply('no active session — /projects to resume one, or start the launcher'); return; }
   // reply to a non-bot message (yours, someone else's, or a bot msg forgotten after a
   // restart) still carries its quote to the active session.
-  await routeTo(ctx, active, quoted + text);
+  await routeTo(ctx, cur, quoted + text);
 });
 
 // Any attachment (document/photo/voice/video/…) -> download into the target session's
