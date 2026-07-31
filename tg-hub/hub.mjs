@@ -336,7 +336,10 @@ function stopThinking(id) {
 function replyKeyboard(chatId) {
   const k = new Keyboard();
   const cur = active.get(chatId);
-  if (order.length) { for (const id of order) k.text(btnOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
+  // Bottom keyboard shows the bare label. It is the one Telegram sends back as ordinary
+  // text, so its caption is also the lookup key — keeping it a plain label keeps that pair
+  // trivial. The project lives on the inline /sessions list instead.
+  if (order.length) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
   k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
 }
@@ -408,6 +411,8 @@ function askDigest(tool, preview) {
 function sessionInline(chatId) {
   const k = new InlineKeyboard();
   const cur = active.get(chatId);
+  // Inline list carries the session id in callback_data, so its caption is never parsed
+  // back — it can afford two lines: project above, session name below.
   for (const id of order) { k.text((id === cur ? '● ' : '') + btnOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
   return k;
@@ -1075,7 +1080,7 @@ bot.on('message:text', async ctx => {
   // Caption and lookup MUST come from the same function: the bottom keyboard sends plain
   // text, so a format change on one side without the other silently turns taps into prompts.
   const bare = stripActiveMark(text);
-  const swId = order.find(x => btnOf(x) === bare);
+  const swId = order.find(x => labelOf(x) === bare);   // bottom keyboard renders the bare label — match on it
   if (swId) { active.set(ctx.chat.id, swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
 
   // /to <label> <text> -> one-off send to a specific session without switching

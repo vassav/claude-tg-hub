@@ -43,34 +43,39 @@ assert.equal(P.take('c3', 999), 'ещё живой', 'внутри ttl отда�
 assert.equal(PENDING_TTL_MS, 600000);
 ok('createPending: замена, одноразовость, протухание по ttl');
 
-// 4. подпись кнопки
-assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: 'd:\\Projects\\vassav\\teamly' }), 'teamly · Ревью-PRs');
-assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: '/home/v/projects/teamly/' }), 'teamly · Ревью-PRs', 'хвостовой слэш не создаёт пустой проект');
-assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: '' }), 'Ревью-PRs', 'без cwd — только метка, без разделителя');
+// 4. подпись кнопки нижней клавиатуры — проект на первой строке, имя на второй
+assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: 'd:\\Projects\\vassav\\teamly' }), 'teamly\nРевью-PRs');
+assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: '/home/v/projects/teamly/' }), 'teamly\nРевью-PRs', 'хвостовой слэш не создаёт пустой проект');
+assert.equal(sessionButton({ label: 'Ревью-PRs', cwd: '' }), 'Ревью-PRs', 'без cwd — одна строка, без переноса');
 assert.equal(sessionButton({ label: 'Ревью-PRs' }), 'Ревью-PRs', 'cwd вообще отсутствует');
 // обрезка: проект 27 симв. -> slice(0,13)+'…', метка 33 симв. -> slice(0,21)+'…'
 assert.equal(sessionButton({ label: 'Давай-разберем-что-можно-и-нельзя', cwd: 'd:\\p\\very-long-project-name-here' }),
-  'very-long-pro… · Давай-разберем-что-мо…', 'проект до 14, метка до 22, с многоточием');
-ok('sessionButton: проект · метка, обрезка, отсутствующий cwd');
+  'very-long-pro…\nДавай-разберем-что-мо…', 'проект до 14, метка до 22, с многоточием');
+ok('sessionButton: проект, перенос, метка; обрезка; отсутствующий cwd');
 
-// 5. снятие отметки активной
-assert.equal(stripActiveMark('teamly · Ревью-PRs ✓'), 'teamly · Ревью-PRs');
-assert.equal(stripActiveMark('teamly · Ревью-PRs'), 'teamly · Ревью-PRs');
-assert.equal(stripActiveMark('  teamly · Ревью ✓  '), 'teamly · Ревью');
+// 5. снятие отметки активной — галочка приклеена к ВТОРОЙ строке, перенос внутри не трогаем
+assert.equal(stripActiveMark('teamly\nРевью-PRs ✓'), 'teamly\nРевью-PRs');
+assert.equal(stripActiveMark('teamly\nРевью-PRs'), 'teamly\nРевью-PRs');
+assert.equal(stripActiveMark('  teamly\nРевью ✓  '), 'teamly\nРевью');
 ok('stripActiveMark: снимает галочку и пробелы, без неё не портит');
 
-// 6. круг: подпись → строка → поиск находит ТУ ЖЕ сессию среди похожих
+// 6. круг для НИЖНЕЙ клавиатуры: она рисует голую метку, Telegram возвращает её текстом,
+// хаб ищет сессию сравнением с меткой. Двухстрочная подпись тут не участвует — она живёт
+// только на инлайн-кнопках, где в callback_data лежит id и разбирать нечего.
 const live = [
-  { id: 'a', label: 'Ревью-PRs', cwd: '/p/teamly' },
-  { id: 'b', label: 'Ревью-PRs', cwd: '/p/other' },   // одинаковые метки, разные проекты
-  { id: 'c', label: 'Ревью', cwd: '/p/teamly' },      // метка — префикс другой
-  { id: 'd', label: '  Ревью-Фиксы  ', cwd: '  /p/other  ' },  // с пробелами — нормализуется
+  { id: 'a', label: 'Ревью-PRs' },
+  { id: 'b', label: 'Ревью' },          // метка — префикс другой
+  { id: 'c', label: 'Ревью-PRs-2' },    // и суффикс тоже
 ];
 for (const s of live) {
-  const shown = sessionButton(s) + ' ✓';
-  const found = live.find(x => sessionButton(x) === stripActiveMark(shown));
+  const shown = s.label + ' ✓';                                  // как рисует replyKeyboard активную
+  const found = live.find(x => x.label === stripActiveMark(shown));
   assert.equal(found.id, s.id, `круг для ${s.id}`);
 }
-ok('круговой разбор: похожие метки различаются по проекту');
+for (const s of live) {                                          // и без галочки, для неактивных
+  const found = live.find(x => x.label === stripActiveMark(s.label));
+  assert.equal(found.id, s.id, `круг без галочки для ${s.id}`);
+}
+ok('круговой разбор нижней клавиатуры: метка ↔ тап, похожие метки не путаются');
 
 console.log(`\n✅ routing-test: ${n} групп проверок пройдено`);
