@@ -37,6 +37,7 @@ let cwd = process.cwd(), boundChatId = '';
 // Token counter for the hub's "Thinking…" bubble. usage.output_tokens is per API CALL, and a
 // turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
 let turnTokens = 0, lastStatusAt = 0;
+let titleAsked = false;   // ask the engine for a session title exactly once (see generate_session_title below)
 
 // ── hub TCP client (mirror of shim/interposer) ───────────────────────────────
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
@@ -152,6 +153,17 @@ function onEngine(o) {
   if (o.type === 'assistant' && o.message?.content) {
     const to = boundChatId || OWNER;
     if (to) for (const b of o.message.content) if (b.type === 'text' && b.text?.trim()) sendHub({ t: 'reply', sessionId: SESSION_ID, chat_id: to, text: b.text });
+    // Name the session the way VS Code names a panel one: ask the ENGINE to generate a
+    // title (subtype seen in extension.js 2.1.220 — generateSessionTitle -> persist:false),
+    // and let the existing control_response listener below relay it to the hub. Nobody
+    // issues this request for a hub-launched session, which is why every one of them fell
+    // back to a slug of its first request. Once per session, after the model has said
+    // something worth summarising.
+    if (!titleAsked) {
+      titleAsked = true;
+      toEngine({ type: 'control_request', request_id: 'tg_' + randomUUID().slice(0, 12),
+        request: { subtype: 'generate_session_title', persist: false } });
+    }
     const out = Number(o.message?.usage?.output_tokens || 0);
     if (out) {
       turnTokens += out;
