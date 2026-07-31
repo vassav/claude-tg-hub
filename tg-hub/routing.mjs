@@ -37,14 +37,27 @@ export function createPending(ttlMs = PENDING_TTL_MS) {
 }
 
 const cut = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
-// Caption for the INLINE /sessions list — project on the first line, session name on the
-// second. Those buttons carry the session id in callback_data, so this caption is never
-// parsed back and can afford two lines. The bottom keyboard deliberately does NOT use it:
-// Telegram sends that one's caption back as ordinary text, and keeping it a bare label
-// keeps caption and lookup trivially in step.
-export function sessionButton({ label, cwd }) {
-  const proj = cwd ? basename(String(cwd).replace(/[\\/]+$/, '')).trim() : '';
-  const name = cut(String(label ?? '').trim(), 22);
-  return proj ? `${cut(proj, 14)}\n${name}` : name;
+
+// Caption for an INLINE button: the session name and nothing else. A button clips its
+// caption to the button's width with no ellipsis of its own, and a newline inside it is
+// collapsed to a space (checked on a real client), so the project cannot live here — it
+// goes into the message text above, where width is not a constraint.
+export const buttonLabel = label => cut(String(label ?? '').trim(), 18);
+
+// Project name for a session: the last path segment of its cwd.
+export const projectOf = cwd => (cwd ? basename(String(cwd).replace(/[\\/]+$/, '')).trim() : '') || '?';
+
+// Group sessions by project for the /sessions listing, preserving the order projects are
+// first seen so the list does not reshuffle between calls.
+export function groupSessions(list) {
+  const out = [];
+  const at = new Map();
+  for (const s of list || []) {
+    const project = projectOf(s.cwd);
+    let g = at.get(project);
+    if (!g) { g = { project, items: [] }; at.set(project, g); out.push(g); }
+    g.items.push(s);
+  }
+  return out;
 }
 export const stripActiveMark = text => String(text ?? '').replace(/\s*✓\s*$/, '').trim();

@@ -27,7 +27,7 @@ import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
 import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
-import { createActive, createPending, sessionButton, stripActiveMark } from './routing.mjs';
+import { createActive, createPending, buttonLabel, groupSessions, stripActiveMark } from './routing.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -160,7 +160,7 @@ function upsertRegistry(id, patch) { registry.set(id, { ...(registry.get(id) || 
 function resumableEntries() { return [...registry.values()].filter(e => e.managed && e.status === 'dead' && !sessions.has(e.id)); }
 
 const labelOf = id => sessions.get(id)?.label || registry.get(id)?.label || id;
-const btnOf = id => sessionButton({ label: labelOf(id), cwd: sessions.get(id)?.cwd });
+const btnOf = id => buttonLabel(labelOf(id));   // inline caption: name only — the project goes in the message text
 
 // Labels keep unicode letters/digits (so a Russian request doesn't collapse to
 // 'session'); everything else becomes '-'. Trimmed, capped at 40 chars.
@@ -840,9 +840,16 @@ bot.command('sessions', async ctx => {
   const resumable = resumableEntries();
   if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
   const cur = active.get(ctx.chat.id);
-  const live = order.map(id => `${id === cur ? '● ' : '○ '}${labelOf(id)} — ${sessions.get(id).cwd}`);
-  const dead = resumable.map(e => `⏸ ${e.label} — ${e.cwd} (resumable)`);
-  await ctx.reply([...live, ...dead].join('\n') || 'no live sessions', { reply_markup: sessionInline(ctx.chat.id) });
+  // The project lives HERE, in the text, grouped — a button clips its caption to the button's
+  // width with no ellipsis and collapses newlines, so nothing but the bare name fits there.
+  const live = groupSessions(order.map(id => ({ id, label: labelOf(id), cwd: sessions.get(id)?.cwd })))
+    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b>`,
+      ...g.items.map(s => `  ${s.id === cur ? '●' : '○'} ${escapeHtml(s.label)}`)]);
+  const dead = groupSessions(resumable.map(e => ({ id: e.id, label: e.label, cwd: e.cwd })))
+    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b> (resumable)`,
+      ...g.items.map(s => `  ⏸ ${escapeHtml(s.label)}`)]);
+  await ctx.reply([...live, ...dead].join('\n') || 'no live sessions',
+    { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) });
   await ctx.reply('switch ↓, resume ⏸, or reply to a session\'s message', { reply_markup: replyKeyboard(ctx.chat.id) });
 });
 
