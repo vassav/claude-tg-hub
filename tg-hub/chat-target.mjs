@@ -6,13 +6,13 @@
 
 export const isGroup = chatId => String(chatId ?? '').startsWith('-');
 
-// Quote the message that asked, so two people talking in one group can tell whose
-// answer is whose. Also works in private chats to point back at the original question.
+// Quote the message that asked, so two people talking in one GROUP can tell whose answer
+// is whose. Deliberately not done in a private chat: there is only one asker, the quote
+// carries no information, and it stacks a second quote block on top of the session header.
 export function replyExtra(last, chatId) {
-  // Quote the message that asked, in ANY chat — group or DM. Two conditions remain: we
-  // must know which message it was, and the answer must be going back to the very chat the
-  // question came from (a session can be driven from several chats).
-  if (!last?.message_id) return {};
+  if (!last?.message_id || !isGroup(chatId)) return {};
+  // A session can be driven from several chats — quote only when the answer goes back to
+  // the very chat the question came from.
   if (String(last.chat_id) !== String(chatId)) return {};
   return { reply_parameters: { message_id: Number(last.message_id), allow_sending_without_reply: true } };
 }
