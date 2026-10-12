@@ -2,7 +2,8 @@
 // Unit test for rich.mjs — no network: every case injects a fake fetch.
 // Run from repo root:  node tg-hub/rich-test.mjs
 import assert from 'node:assert/strict';
-import { richBody, sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
+import { richBody, sendRich, RICH_LIMIT, chooseFileMethod, PHOTO_EXT, CAPTION_LIMIT } from './rich.mjs';
+import * as richModule from './rich.mjs';
 
 let n = 0; const ok = m => { n++; console.log('  ✓', m); };
 
@@ -29,34 +30,38 @@ const fakeFalse = async () => ({ json: async () => ({ ok: false, description: 'B
 const fakeThrow = async () => { throw new Error('socket hang up'); };
 const fakeGarbage = async () => ({ json: async () => { throw new Error('not json'); } });
 const fakeNoResult = async () => ({ json: async () => ({ ok: true }) });
+const logged = [];
+const log = (...a) => logged.push(a.join(' '));
 for (const [label, f] of [['ok:false', fakeFalse], ['исключение сети', fakeThrow], ['нечитаемый ответ', fakeGarbage], ['ok:true без result', fakeNoResult]]) {
-  const r = await sendRich({ apiRoot: 'x', token: 'T', chatId: '1', markdown: 'y', fetchImpl: f });
+  const r = await sendRich({ apiRoot: 'x', token: 'T', chatId: '1', markdown: 'y', fetchImpl: f, log });
   assert.equal(r, null, label);
 }
 ok('sendRich: ok:false / бросок / мусор / ok:true без result → null, без исключения наружу');
 
-// 4. sendThinking
-const draftCalls = [];
-const fakeDraft = async (url, init) => { draftCalls.push({ url, body: JSON.parse(init.body) }); return { json: async () => ({ ok: true, result: true }) }; };
-assert.equal(await sendThinking({ apiRoot: 'https://api.telegram.org', token: 'T', chatId: 300, draftId: 5, text: 'Thinking… · 3 с', fetchImpl: fakeDraft }), true);
-assert.equal(draftCalls[0].url, 'https://api.telegram.org/botT/sendRichMessageDraft');
-assert.equal(draftCalls[0].body.chat_id, 300);
-assert.equal(draftCalls[0].body.draft_id, 5);
-assert.equal(draftCalls[0].body.rich_message.markdown, '<tg-thinking>Thinking… · 3 с</tg-thinking>');
-assert.equal(await sendThinking({ apiRoot: 'x', token: 'T', chatId: 1, draftId: 1, text: 'z', fetchImpl: fakeThrow }), false);
-ok('sendThinking: оборачивает текст в <tg-thinking>, отказ → false');
+// 3b. каждый отказ ОБЪЯСНЁН в логе — иначе фоллбек молча отдаёт тот же текст без таблиц
+assert.equal(logged.length, 4, 'все четыре отказа записаны');
+assert.ok(logged[0].includes('Bad Request: nope'), 'описание от Telegram попадает в лог');
+assert.ok(logged[1].includes('socket hang up'), 'сетевой бросок объяснён');
+assert.ok(logged[3].includes('ok:true without result'), 'ответ без result назван своими словами');
+assert.ok(!logged.some(l => l.includes('markdown')), 'тело сообщения в лог не утекает');
+ok('sendRich: причина отказа уходит в лог, тело — нет');
 
-// 5. thinkingText
-const t0 = 1000000;
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 3000 }), 'Thinking… · 3 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 3000, tokens: 0 }), 'Thinking… · 3 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 23000, tokens: 1800 }), 'Thinking… · 1.8k tokens · 23 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 23000, tokens: 999 }), 'Thinking… · 999 tokens · 23 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 23000, tokens: 1000 }), 'Thinking… · 1.0k tokens · 23 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 99000 }), 'Thinking… · 99 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 100000 }), 'Thinking… · 1 м 40 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 + 605000 }), 'Thinking… · 10 м 5 с');
-assert.equal(thinkingText({ startedAt: t0, now: t0 }), 'Thinking… · 0 с');
-ok('thinkingText: секунды, минуты, форматирование токенов, отсутствие токенов');
+// 4. драфт «Thinking…» убран из хаба — модуль больше не должен его предлагать
+assert.equal(typeof richModule.sendThinking, 'undefined', 'sendThinking удалён вместе с пузырём');
+assert.equal(typeof richModule.thinkingText, 'undefined', 'и его текст тоже');
+ok('rich.mjs: пузыря Thinking… больше нет');
+
+// 5. chooseFileMethod — авто-выбор по расширению + форс
+assert.equal(chooseFileMethod('/tmp/shot.png'), 'sendPhoto');
+assert.equal(chooseFileMethod('C:\\x\\PHOTO.JPG'), 'sendPhoto', 'регистр расширения не важен');
+assert.equal(chooseFileMethod('/tmp/a.jpeg'), 'sendPhoto');
+assert.equal(chooseFileMethod('/tmp/report.pdf'), 'sendDocument');
+assert.equal(chooseFileMethod('/tmp/run.log'), 'sendDocument');
+assert.equal(chooseFileMethod('/tmp/diagram.svg'), 'sendDocument', 'svg — документ: Telegram не покажет его как фото');
+assert.equal(chooseFileMethod('/tmp/noext'), 'sendDocument', 'без расширения → документ');
+assert.equal(chooseFileMethod('/tmp/shot.png', 'document'), 'sendDocument', 'as:document форсирует документ (без пережатия)');
+assert.equal(chooseFileMethod('/tmp/report.pdf', 'photo'), 'sendPhoto', 'as:photo форсирует фото');
+assert.ok(PHOTO_EXT.has('.webp') && CAPTION_LIMIT === 1024);
+ok('chooseFileMethod: .png/.jpg/… → sendPhoto, прочее → sendDocument, as форсирует');
 
 console.log(`\n✅ rich-test: ${n} групп проверок пройдено`);

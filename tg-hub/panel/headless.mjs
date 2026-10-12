@@ -34,7 +34,7 @@ function safeStr(v) { try { return typeof v === 'string' ? v : JSON.stringify(v)
 const args = process.argv.slice(2);            // [claudeExe, ...claudeArgs]
 const exe = args[0], rest = args.slice(1);
 let cwd = process.cwd(), boundChatId = '';
-// Token counter for the hub's "Thinking…" bubble. usage.output_tokens is per API CALL, and a
+// Token counter for the hub's ⚡ mark in /sessions. usage.output_tokens is per API CALL, and a
 // turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
 let turnTokens = 0, lastStatusAt = 0;
 let titleAsked = false;   // ask the engine for a session title exactly once (see generate_session_title below)
@@ -138,8 +138,12 @@ function resolveApproval(synthId, behavior, picks, denyMsg, sugIdx) {
 
 // ── engine output handler ─────────────────────────────────────────────────────
 function onEngine(o) {
-  // new turn → new counter
-  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; }
+  // new turn → new counter. Also tell the hub the turn STARTED: an answer alone can't mark
+  // the end (the model speaks mid-turn and keeps working), so the hub needs both edges.
+  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; sendHub({ t: 'turn', sessionId: SESSION_ID, state: 'start' }); }
+  // `result` is the engine's end-of-turn record under --output-format stream-json. This is
+  // the ONLY honest "it stopped working" signal we get.
+  if (o.type === 'result') { sendHub({ t: 'turn', sessionId: SESSION_ID, state: 'end' }); return; }
   // my own control-command responses (context/rc) — formatted + sent to Telegram
   if (o.type === 'control_response') {
     if (cmds.onControlResponse(o)) return;

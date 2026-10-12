@@ -61,3 +61,27 @@ export function groupSessions(list) {
   return out;
 }
 export const stripActiveMark = text => String(text ?? '').replace(/\s*✓\s*$/, '').trim();
+
+// ── what a session is doing right now ────────────────────────────────────────
+// 'work' — a turn is running (input delivered, or the model is still emitting),
+// 'perm' — stopped on a tool approval and waiting for a human,
+// 'idle' — connected and silent.
+// A turn with no signal for longer than WORK_TTL_MS is treated as over: a session can
+// die without a word, and a permanent "⚡ working" would be a lie no one can clear.
+export const WORK_TTL_MS = 600000;   // 10 min
+export function sessionState({ since, awaitingPerm, now = Date.now(), ttlMs = WORK_TTL_MS } = {}) {
+  if (awaitingPerm) return 'perm';                       // waiting on a human outranks working
+  return since && now - since < ttlMs ? 'work' : 'idle';
+}
+export const stateMark = state => (state === 'work' ? '⚡' : state === 'perm' ? '🔐' : '');
+// "42 с" / "3 м 07 с" — how long the current turn has been running.
+export function fmtDur(ms) {
+  const s = Math.max(0, Math.floor(Number(ms) / 1000));
+  return s < 60 ? `${s} с` : `${Math.floor(s / 60)} м ${String(s % 60).padStart(2, '0')} с`;
+}
+// "820" / "3.4k" — output tokens of the running turn. Only stream sessions report usage;
+// a channels one never does, so the caller must be ready for zero.
+export const fmtTokens = n => {
+  const v = Math.max(0, Math.floor(Number(n) || 0));   // undefined/NaN → 0, never "NaNk"
+  return v < 1000 ? String(v) : (v / 1000).toFixed(1) + 'k';
+};

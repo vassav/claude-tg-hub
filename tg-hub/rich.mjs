@@ -20,28 +20,36 @@ async function post(apiRoot, token, method, body, fetchImpl) {
   return res.json();
 }
 
-export async function sendRich({ apiRoot, token, chatId, markdown, extra, fetchImpl }) {
+// A refusal must never be silent: the fallback renders the SAME text without tables, so
+// from the outside a rejected rich message and a plain one look alike, and the only place
+// the reason ever existed was Telegram's `description`. Log it, send nothing of the body.
+export async function sendRich({ apiRoot, token, chatId, markdown, extra, fetchImpl, log = console.error }) {
   try {
     const j = await post(apiRoot, token, 'sendRichMessage', richBody({ chatId, markdown, extra }), fetchImpl);
-    return j?.ok && j.result ? j.result : null;
-  } catch { return null; }
+    if (j?.ok && j.result) return j.result;
+    log('[rich] rejected:', j?.error_code ?? '?', j?.description || 'ok:true without result', `(${markdown?.length ?? 0} chars)`);
+    return null;
+  } catch (e) { log('[rich] failed:', e?.message || String(e)); return null; }
 }
 
-// The thinking bubble is a DRAFT: ephemeral, 30s, private chats only, animated between
-// updates that share a draft_id. It returns True, not a Message — nothing to track.
-export async function sendThinking({ apiRoot, token, chatId, draftId, text, fetchImpl }) {
-  try {
-    const body = { chat_id: chatId, draft_id: draftId, rich_message: { markdown: `<tg-thinking>${text}</tg-thinking>` } };
-    const j = await post(apiRoot, token, 'sendRichMessageDraft', body, fetchImpl);
-    return !!j?.ok;
-  } catch { return false; }
+// ── send_file: local file → chat ────────────────────────────────────────────
+// Which Bot API method uploads this file? Telegram renders a photo inline but recompresses
+// it and caps dimensions; a document is byte-exact. `as:"auto"` (default) picks sendPhoto for
+// common raster images, sendDocument for everything else (PDF, logs, SVG, …). `as:"photo"`/
+// `as:"document"` force it — e.g. a PNG sent as a document keeps full quality.
+export const PHOTO_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+export const CAPTION_LIMIT = 1024;   // Telegram caption cap (sendPhoto/sendDocument)
+
+export function chooseFileMethod(path, as = 'auto') {
+  if (as === 'photo') return 'sendPhoto';
+  if (as === 'document') return 'sendDocument';
+  const name = String(path || '');
+  const dot = name.lastIndexOf('.');
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : '';
+  return PHOTO_EXT.has(ext) ? 'sendPhoto' : 'sendDocument';
 }
 
-const fmtTokens = n => (n < 1000 ? String(n) : (n / 1000).toFixed(1) + 'k');
-const fmtSecs = s => (s < 100 ? `${s} с` : `${Math.floor(s / 60)} м ${s % 60} с`);
-// "Thinking… · 1.8k tokens · 23 с" — tokens only when we know them (channels sessions don't
-// report usage), elapsed time always.
-export function thinkingText({ startedAt, tokens, now }) {
-  const secs = Math.max(0, Math.floor(((now ?? Date.now()) - startedAt) / 1000));
-  return ['Thinking…', tokens ? `${fmtTokens(tokens)} tokens` : null, fmtSecs(secs)].filter(Boolean).join(' · ');
-}
+// The live "Thinking…" draft used to live here (sendRichMessageDraft + its text builder).
+// Dropped on request: a bubble repainting itself in the DM every 10 seconds was more
+// irritating than useful. What a session is doing now shows in /sessions instead, as ⚡ with
+// the elapsed time and the turn's tokens. Git history has the draft code if it's ever wanted.

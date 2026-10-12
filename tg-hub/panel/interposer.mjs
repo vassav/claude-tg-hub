@@ -77,7 +77,7 @@ const { port: HUB_PORT, token: HUB_TOKEN } = discover();
 
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
 let sessionId = null, cwd = process.cwd(), boundChatId = '';
-// Token counter for the hub's "Thinking…" bubble. usage.output_tokens is per API CALL, and a
+// Token counter for the hub's ⚡ mark in /sessions. usage.output_tokens is per API CALL, and a
 // turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
 let turnTokens = 0, lastStatusAt = 0;
 // browser MCP co-ownership with the panel: base = the panel's last dynamic-server
@@ -232,8 +232,12 @@ function outForwarder() {
   };
 }
 function onOut(o) {                                   // engine -> extension
-  // new turn → new counter
-  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; }
+  // new turn → new counter, and both edges of the turn go to the hub: an answer alone
+  // can't mark the end, since the model speaks mid-turn and then keeps working.
+  if (o.type === 'user') { turnTokens = 0; lastStatusAt = 0; if (sessionId) sendHub({ t: 'turn', sessionId, state: 'start' }); }
+  // `result` is the engine's end-of-turn record — the only honest "it stopped" signal.
+  // Never DROP it: the panel needs it too.
+  if (o.type === 'result' && sessionId) sendHub({ t: 'turn', sessionId, state: 'end' });
   // identity: learn session_id ASAP — the first system hook (hook_started) already
   // carries it — and register immediately, so the panel shows up in /sessions even
   // before its first turn (system/init only fires once a turn starts). cwd defaults

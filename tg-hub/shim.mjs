@@ -11,7 +11,7 @@
 import net from 'node:net';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, basename } from 'node:path';
+import { join, basename, isAbsolute, resolve } from 'node:path';
 
 function discover() {
   let port = Number(process.env.HUB_PORT) || 0;
@@ -66,6 +66,21 @@ function notifyHub(text, chat_id) {
     setTimeout(() => fin({ ok: false, error: 'timeout (is the hub running?)' }), 5000);
   });
 }
+// Send a local file (photo/document) to Telegram via the hub. Same one-shot TCP as
+// notifyHub — the hub and this shim share the filesystem, so we pass the PATH, not bytes.
+function sendFileHub({ path, caption, chat_id, as }) {
+  return new Promise(resolve => {
+    const sock = net.connect({ host: '127.0.0.1', port: HUB_PORT });
+    let buf = '', done = false;
+    const fin = v => { if (done) return; done = true; try { sock.destroy(); } catch {} resolve(v); };
+    sock.setEncoding('utf8');
+    sock.on('connect', () => sock.write(JSON.stringify({ t: 'send_file', token: HUB_TOKEN, path, ...(caption ? { caption } : {}), ...(chat_id ? { chat_id } : {}), ...(as ? { as } : {}) }) + '\n'));
+    sock.on('data', d => { buf += d; const i = buf.indexOf('\n'); if (i >= 0) { let r; try { r = JSON.parse(buf.slice(0, i)); } catch {} fin(r || { ok: false, error: 'bad response' }); } });
+    sock.on('error', e => fin({ ok: false, error: 'hub not reachable: ' + (e.code || e.message) }));
+    sock.on('close', () => fin({ ok: false, error: 'hub closed (token?)' }));
+    setTimeout(() => fin({ ok: false, error: 'timeout (is the hub running?)' }), 15000);
+  });
+}
 function onHub(m) {
   log('HUB->', m);
   if (m.t === 'inbound') toEngine({ jsonrpc: '2.0', method: 'notifications/claude/channel', params: { content: m.content, meta: m.meta || {} } });
@@ -108,6 +123,11 @@ function handle(msg) {
         'Right after handling the FIRST message of a new conversation — whether it arrived as a <channel>',
         'message or as an ordinary user turn — also call `set_title` ONCE with',
         "a short (≤40 chars) title summarizing it, in the user's language. Do not announce set_title.",
+        // Text-only channel: the user sees ONLY what the tools send. To deliver a picture or
+        // file (a screenshot, a generated image/PDF, a log), use `send_file` with its local
+        // path — pasting the path as text in `reply` sends them nothing they can open.
+        'To send the user a picture or file (screenshot, generated image, PDF, log), call',
+        '`send_file` with the local path — do NOT just mention the path in `reply`, it is not reachable to them.',
       ].join(' '),
     }});
     return;
@@ -126,6 +146,15 @@ function handle(msg) {
       name: 'notify',
       description: 'Send a standalone notification to the user on Telegram via the hub. Unlike `reply` (which answers an inbound <channel> message and needs its chat_id), `notify` needs no chat_id and works even if this session is NOT attached to the hub — use it to ping the user when a long task finishes or needs their attention.',
       inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'Message text; Markdown is rendered.' }, chat_id: { type: 'string', description: 'Optional target chat; defaults to the hub home chat.' } }, required: ['text'] },
+    }, {
+      name: 'send_file',
+      description: 'Send a local file (screenshot, generated image, PDF, log, …) to the user on Telegram. Give a path on THIS machine; by default `.png/.jpg/.gif/.webp` go as an inline photo and everything else as a document. Works even if this session is NOT attached to the hub. Use it whenever the user wants to SEE a file rather than its text.',
+      inputSchema: { type: 'object', properties: {
+        path: { type: 'string', description: 'Path to the file on this machine. Absolute, or relative to the session working directory.' },
+        caption: { type: 'string', description: 'Optional caption (Markdown rendered; max ~1024 chars).' },
+        chat_id: { type: 'string', description: 'Optional target chat; defaults to the hub home chat. Pass the chat_id from an inbound <channel> tag to answer that user.' },
+        as: { type: 'string', enum: ['auto', 'photo', 'document'], description: 'auto (default) = photo for images, document otherwise. Force `document` to send an image without recompression.' },
+      }, required: ['path'] },
     }] }});
     return;
   }
@@ -147,6 +176,17 @@ function handle(msg) {
       notifyHub(text, a.chat_id ? String(a.chat_id) : undefined).then(r => {
         toEngine({ jsonrpc: '2.0', id, result: (r && r.ok)
           ? { content: [{ type: 'text', text: 'sent to Telegram' }] }
+          : { content: [{ type: 'text', text: 'failed: ' + (r?.error || 'unknown') }], isError: true } });
+      });
+      return;
+    }
+    if (params?.name === 'send_file') {
+      const raw = String(a.path ?? '').trim();
+      if (!raw) { toEngine({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'path is required' }], isError: true } }); return; }
+      const path = isAbsolute(raw) ? raw : resolve(process.cwd(), raw);  // relative → session cwd
+      sendFileHub({ path, caption: a.caption ? String(a.caption) : undefined, chat_id: a.chat_id ? String(a.chat_id) : undefined, as: a.as ? String(a.as) : undefined }).then(r => {
+        toEngine({ jsonrpc: '2.0', id, result: (r && r.ok)
+          ? { content: [{ type: 'text', text: 'sent to Telegram' + (r.method ? ` (${r.method})` : '') }] }
           : { content: [{ type: 'text', text: 'failed: ' + (r?.error || 'unknown') }], isError: true } });
       });
       return;

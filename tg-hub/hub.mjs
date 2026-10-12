@@ -21,13 +21,13 @@ import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSy
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
-import { Bot, InlineKeyboard, Keyboard } from 'grammy';
+import { Bot, InlineKeyboard, Keyboard, InputFile } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
 import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
-import { sendRich, sendThinking, thinkingText, RICH_LIMIT } from './rich.mjs';
-import { createActive, createPending, buttonLabel, groupSessions, stripActiveMark } from './routing.mjs';
+import { sendRich, RICH_LIMIT, chooseFileMethod, CAPTION_LIMIT } from './rich.mjs';
+import { createActive, createPending, buttonLabel, groupSessions, stripActiveMark, sessionState, stateMark, fmtDur, fmtTokens } from './routing.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -75,8 +75,10 @@ const permMsg = new Map();      // request_id -> { mid, chat } of the approval/a
 const askState = new Map();     // request_id -> { sessionId, qs, picks:number[][], cur }  (AskUserQuestion cards)
 const outMsgToSession = new Map();
 const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, user_id, pending, ambiguous } of the message that most recently drove it
-const thinking = new Map();   // sessionId -> { chatId, draftId, startedAt, tokens, timer } — live "Thinking…" draft
-let draftSeq = 0;             // draft_id must be a non-zero Integer; a NEW one per turn, since same-id edits animate
+// Which sessions are mid-turn, for the ⚡ mark in /sessions. This replaced the live
+// "Thinking…" draft bubble: a draft repainted every 10s in the DM was noise, while the
+// same knowledge is worth having on demand, in the list, for every chat including groups.
+const working = new Map();    // sessionId -> { since, tokens } of the running turn
 const active = createActive();                 // chatId -> sessionId; no global pointer
 const pending = createPending();   // chatId -> text written before the chat had an active session
 const activeIn = ctx => active.get(ctx.chat?.id);
@@ -212,7 +214,30 @@ function armAutoName(id, body) {
   }, TITLE_TIMEOUT_MS);
 }
 const notify = (text, extra) => bot.api.sendMessage(CHAT, text, extra).catch(() => {});
-function sendToSession(id, obj) { const s = sessions.get(id); if (s?.conn) { s.conn.write(JSON.stringify(obj) + '\n'); return true; } return false; }
+function sendToSession(id, obj) {
+  const s = sessions.get(id); if (!s?.conn) return false;
+  s.conn.write(JSON.stringify(obj) + '\n');
+  // Every path that feeds a session goes through here — a Telegram message, a held line
+  // delivered on switch, a queued first message, an external inject, an approval verdict
+  // that unblocks a waiting turn. One hook instead of eight call sites, and a ninth one
+  // added later can't forget it.
+  if (obj.t === 'inbound' || obj.t === 'permission_decision') markWorking(id);
+  return true;
+}
+const markWorking = id => { if (!working.has(id)) working.set(id, { since: Date.now(), tokens: 0 }); };
+const clearWorking = id => working.delete(id);
+// A tool approval belongs to exactly one session; a session can have several open.
+const awaitsPerm = id => { for (const s of pendingPerm.values()) if (s === id) return true; return false; };
+const stateOf = id => sessionState({ since: working.get(id)?.since, awaitingPerm: awaitsPerm(id) });
+// "⚡ 1 м 20 с · 3.4k" / "🔐 ждёт аппрув" — the tail of a session's line in /sessions.
+// Tokens only when the session reports usage: channels sessions never do.
+function stateSuffix(id) {
+  const st = stateOf(id);
+  if (st === 'perm') return ' 🔐 ждёт аппрув';
+  if (st !== 'work') return '';
+  const w = working.get(id);
+  return ` ⚡ ${fmtDur(Date.now() - w.since)}${w.tokens ? ` · ${fmtTokens(w.tokens)}` : ''}`;
+}
 
 // ── Telegram rendering ───────────────────────────────────────────────────────
 // Sessions (panel & CLI) emit Markdown: **bold**, `code`, ```fences```, [t](url),
@@ -306,33 +331,6 @@ async function editTg(chatId, messageId, text, extra = {}) {
   return null;
 }
 
-// While a session works, show a live draft instead of silence. Drafts are ephemeral (30s),
-// animated between updates sharing a draft_id, and PRIVATE CHATS ONLY — a group gets no
-// bubble (sendRichMessageDraft answers TEXTDRAFT_PEER_INVALID there). Failure costs nothing:
-// a draft is not a message, nothing references it.
-const THINK_EVERY_MS = 10000;    // draft TTL is 30s — three shots at each refresh
-const THINK_MAX_MS = 600000;     // safety net: stop pretending after 10 minutes
-function paintThinking(id) {
-  const e = thinking.get(id); if (!e) return;
-  if (Date.now() - e.startedAt > THINK_MAX_MS) { stopThinking(id); return; }
-  sendThinking({ apiRoot: API_ROOT, token: TOKEN, chatId: e.chatId, draftId: e.draftId,
-    text: thinkingText({ startedAt: e.startedAt, tokens: e.tokens }) });
-}
-function startThinking(id, chatId) {
-  if (isGroup(chatId)) return;              // drafts don't exist in groups
-  stopThinking(id);                          // a new turn gets a fresh draft_id
-  const e = { chatId: Number(chatId), draftId: ++draftSeq, startedAt: Date.now(), tokens: 0, timer: null };
-  thinking.set(id, e);
-  paintThinking(id);
-  e.timer = setInterval(() => paintThinking(id), THINK_EVERY_MS);
-  e.timer.unref?.();                         // never hold the daemon open on this alone
-}
-function stopThinking(id) {
-  const e = thinking.get(id); if (!e) return;
-  clearInterval(e.timer);
-  thinking.delete(id);
-}
-
 function replyKeyboard(chatId) {
   const k = new Keyboard();
   const cur = active.get(chatId);
@@ -413,9 +411,28 @@ function sessionInline(chatId) {
   const cur = active.get(chatId);
   // Inline list carries the session id in callback_data, so its caption is never parsed
   // back — it can afford two lines: project above, session name below.
-  for (const id of order) { k.text((id === cur ? '● ' : '') + btnOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
+  // ⚡/🔐 goes BEFORE the name: the caption is clipped to the button's width from the
+  // right, so a mark at the tail is the first thing a long name would eat.
+  for (const id of order) { const mk = stateMark(stateOf(id)); k.text((id === cur ? '● ' : '') + (mk ? mk + ' ' : '') + btnOf(id), `switch:${id}`).text('🛑', `stop:${id}`).row(); }
   for (const e of resumableEntries()) k.text(`⏸ ${e.label} — resume`, `resume:${e.id}`).text('🗑', `forget:${e.id}`).row();
+  // ⚡ and the elapsed time are a snapshot of the moment the list was drawn — without a way
+  // to redraw it, a session that finished a minute ago still looks busy.
+  if (order.length) k.text('🔄 обновить', 'refresh');
   return k;
+}
+// The /sessions body: projects with their live sessions, then the resumable ones. Built
+// apart from the handler so 🔄 обновить can redraw the very same text in place.
+function sessionsText(chatId) {
+  const cur = active.get(chatId);
+  // The project lives HERE, in the text, grouped — a button clips its caption to the button's
+  // width with no ellipsis and collapses newlines, so nothing but the bare name fits there.
+  const live = groupSessions(order.map(id => ({ id, label: labelOf(id), cwd: sessions.get(id)?.cwd })))
+    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b>`,
+      ...g.items.map(s => `  ${s.id === cur ? '●' : '○'} ${escapeHtml(s.label)}${stateSuffix(s.id)}`)]);
+  const dead = groupSessions(resumableEntries().map(e => ({ id: e.id, label: e.label, cwd: e.cwd })))
+    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b> (resumable)`,
+      ...g.items.map(s => `  ⏸ ${escapeHtml(s.label)}`)]);
+  return [...live, ...dead].join('\n') || 'no live sessions';
 }
 async function routeTo(ctx, id, body) {
   const meta = {
@@ -427,7 +444,6 @@ async function routeTo(ctx, id, body) {
   // first is answered — nextInbound() tracks that and marks the entry ambiguous so
   // we quote nobody rather than the wrong person (see chat-target.mjs).
   lastInbound.set(id, nextInbound(lastInbound.get(id), meta));
-  startThinking(id, meta.chat_id);   // silence → a live draft while the session works
   armAutoName(id, body); // first request → name the session (model set_title, else slug fallback)
   return true;
 }
@@ -670,11 +686,25 @@ net.createServer(sock => {
         if (first) { pendingFirstMsg.delete(sid); if (sendToSession(sid, { t: 'inbound', content: first.content, meta: first.meta })) armAutoName(sid, first.content); }
       } else if (m.t === 'title') {
         applyName(m.sessionId, m.title, true); // the session's claude named itself
+      } else if (m.t === 'turn') {
+        // Both edges of a turn, from a stream bridge: 'start' on the engine's user message
+        // (so a turn typed in the PANEL also lights up), 'end' on its result record.
+        const s = sessions.get(m.sessionId); if (s) s.sawTurn = true;   // this bridge reports turn edges
+        if (m.state === 'end') clearWorking(m.sessionId); else markWorking(m.sessionId);
       } else if (m.t === 'status') {
-        const e = thinking.get(m.sessionId);      // only meaningful while a bubble is up
-        if (e) { e.tokens = Number(m.tokens || 0); paintThinking(m.sessionId); }
+        // A status may START the mark only from a bridge that also reports turn edges: the
+        // engine emits one right AFTER the answer (checked: turn:start → reply → status →
+        // turn:end), so without an end signal to follow it the ⚡ would never go out.
+        if (sessions.get(m.sessionId)?.sawTurn) markWorking(m.sessionId);
+        const w = working.get(m.sessionId); if (w) w.tokens = Number(m.tokens || 0);
       } else if (m.t === 'reply') {
-        stopThinking(m.sessionId);   // the answer itself replaces the draft
+        // A channels session has no end-of-turn signal at all, so its answer is the only
+        // thing that can clear the mark. A stream session sends `turn end` instead — and
+        // clearing on its reply would be wrong twice over: the model speaks mid-turn, and
+        // the very next thing after an answer is a `status` that would light it up again.
+        // A bridge from before turn edges existed reports neither, so fall back to the old
+        // rule for it — otherwise its ⚡ would hang until the ttl.
+        if (!(isStream(m.sessionId) && sessions.get(m.sessionId)?.sawTurn)) clearWorking(m.sessionId);
         const to = m.chat_id || CHAT;
         const last = lastInbound.get(m.sessionId);
         // Header as a blockquote, ALWAYS, in every chat. The blank line is load-bearing:
@@ -685,7 +715,7 @@ net.createServer(sock => {
         sendMd(to, header + m.text, m.sessionId, {}, last?.ambiguous ? {} : replyExtra(last, to));
         if (last) last.pending = false;  // answered — the next writer isn't competing with anyone
       } else if (m.t === 'permission_request') {
-        stopThinking(m.sessionId);
+        clearWorking(m.sessionId);   // not working — waiting on a human; the list says 🔐 while pendingPerm holds it
         pendingPerm.set(m.request_id, m.sessionId);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
           // The card belongs where the question came from: a person asking from a group
@@ -763,8 +793,34 @@ net.createServer(sock => {
         if (m.token !== IPC_TOKEN) { sock.end(); return; }
         const text = String(m.text ?? '').trim();
         if (!text) { sock.write(JSON.stringify({ ok: false, error: 'empty text' }) + '\n'); return; }
-        sendTg(m.chat_id || CHAT, text);
+        // Same render path as a session's reply: a notification is model-written Markdown
+        // too, and going through sendTg dropped its tables into rows of pipes.
+        sendMd(m.chat_id || CHAT, text);
         sock.write(JSON.stringify({ ok: true }) + '\n');
+      } else if (m.t === 'send_file') {
+        // A local file (screenshot, generated image, PDF, log) → the chat. Hub and the
+        // calling shim share the filesystem, so we read the PATH from disk — no bytes on
+        // the wire. Photo vs document is chosen by extension (or forced via `as`).
+        if (m.token !== IPC_TOKEN) { sock.end(); return; }
+        const path = String(m.path ?? '').trim();
+        if (!path) { sock.write(JSON.stringify({ ok: false, error: 'empty path' }) + '\n'); return; }
+        if (!existsSync(path)) { sock.write(JSON.stringify({ ok: false, error: 'file not found: ' + path }) + '\n'); return; }
+        const method = chooseFileMethod(path, m.as);
+        const to = m.chat_id || CHAT;
+        const rawCap = String(m.caption ?? '').trim();
+        // Caption counts toward Telegram's 1024-char cap on the VISIBLE text; cut the raw
+        // Markdown first, then render. An over-long caption rejects the whole upload.
+        const cap = rawCap.slice(0, CAPTION_LIMIT);
+        const opts = cap ? { caption: mdToTgHtml(cap), parse_mode: 'HTML' } : {};
+        bot.api[method](to, new InputFile(path), opts)
+          .then(() => sock.write(JSON.stringify({ ok: true, method }) + '\n'))
+          .catch(e => {
+            // HTML caption rejected (bad entities) → retry once with the plain caption.
+            const plainOpts = cap ? { caption: cap } : {};
+            bot.api[method](to, new InputFile(path), plainOpts)
+              .then(() => sock.write(JSON.stringify({ ok: true, method }) + '\n'))
+              .catch(e2 => sock.write(JSON.stringify({ ok: false, error: (e2?.description || e2?.message || String(e2)) }) + '\n'));
+          });
       }
     }
   });
@@ -774,7 +830,7 @@ net.createServer(sock => {
     const label = labelOf(sid);
     sessions.delete(sid);
     lastInbound.delete(sid); // a resume reuses this id — don't quote a message from its previous life
-    stopThinking(sid);
+    clearWorking(sid);
     for (const [rid, st] of askState) if (st.sessionId === sid) askState.delete(rid); // its cards can never resolve now
     const i = order.indexOf(sid); if (i >= 0) order.splice(i, 1);
     active.clearSession(sid);   // no guessing a replacement — the next message would land somewhere random
@@ -839,18 +895,9 @@ bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
   const resumable = resumableEntries();
   if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
-  const cur = active.get(ctx.chat.id);
-  // The project lives HERE, in the text, grouped — a button clips its caption to the button's
-  // width with no ellipsis and collapses newlines, so nothing but the bare name fits there.
-  const live = groupSessions(order.map(id => ({ id, label: labelOf(id), cwd: sessions.get(id)?.cwd })))
-    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b>`,
-      ...g.items.map(s => `  ${s.id === cur ? '●' : '○'} ${escapeHtml(s.label)}`)]);
-  const dead = groupSessions(resumable.map(e => ({ id: e.id, label: e.label, cwd: e.cwd })))
-    .flatMap(g => [`📁 <b>${escapeHtml(g.project)}</b> (resumable)`,
-      ...g.items.map(s => `  ⏸ ${escapeHtml(s.label)}`)]);
-  await ctx.reply([...live, ...dead].join('\n') || 'no live sessions',
-    { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) });
-  await ctx.reply('switch ↓, resume ⏸, or reply to a session\'s message', { reply_markup: replyKeyboard(ctx.chat.id) });
+  await ctx.reply(sessionsText(ctx.chat.id), { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) });
+  await ctx.reply('⚡ работает · 🔐 ждёт аппрув · ● активная\nswitch ↓, resume ⏸, or reply to a session\'s message',
+    { reply_markup: replyKeyboard(ctx.chat.id) });
 });
 
 bot.command('projects', async ctx => {
@@ -872,7 +919,7 @@ bot.command('stop', async ctx => {
   const id = order.find(x => labelOf(x) === arg || x === arg);
   if (!id) { await ctx.reply('not found — /sessions to list'); return; }
   sendToSession(id, { t: 'stop' });
-  stopThinking(id);
+  clearWorking(id);
   registry.delete(id); saveRegistry(); // explicit stop → don't offer as resumable
   await ctx.reply(`🛑 stopping ${labelOf(id)}…`);
 });
@@ -901,6 +948,15 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data;
   let m;
 
+  if (data === 'refresh') {
+    // Redraw the list in place. Telegram rejects an edit that changes nothing ("message is
+    // not modified"), and that is precisely the "nothing moved" case — say so on the toast.
+    await ctx.editMessageText(sessionsText(ctx.chat.id), { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) })
+      .then(() => ctx.answerCallbackQuery().catch(() => {}))
+      .catch(() => ctx.answerCallbackQuery({ text: 'без изменений' }).catch(() => {}));
+    return;
+  }
+
   if ((m = /^switch:(.+)$/.exec(data))) {
     const id = m[1];
     if (sessions.has(id)) {
@@ -916,7 +972,7 @@ bot.on('callback_query:data', async ctx => {
 
   if ((m = /^stop:(.+)$/.exec(data))) {
     const id = m[1];
-    if (sessions.has(id)) { sendToSession(id, { t: 'stop' }); stopThinking(id); registry.delete(id); saveRegistry(); await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); }
+    if (sessions.has(id)) { sendToSession(id, { t: 'stop' }); clearWorking(id); registry.delete(id); saveRegistry(); await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); }
     else await ctx.answerCallbackQuery({ text: 'already gone' }).catch(() => {});
     return;
   }

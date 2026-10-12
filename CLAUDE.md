@@ -26,8 +26,10 @@ channels-хаб (см. Статус). *(Исходная стратегия fork
 claude-in-chrome MCP через `control_request{mcp_set_servers}`; мост `claude --claude-in-chrome-mcp`
 автономен, VS Code не нужен — см. [`docs/specs/2026-07-27-tg-browser-command.md`](docs/specs/2026-07-27-tg-browser-command.md)),
 **нативный рендер ответов** (Rich Messages Bot API 10.1: Markdown модели уходит в Telegram
-как есть — таблицы, заголовки, подсвеченный код; плюс живой пузырь `Thinking…` с временем и
-токенами в личке — см. [`docs/specs/2026-07-29-rich-messages.md`](docs/specs/2026-07-29-rich-messages.md)),
+как есть — таблицы, заголовки, подсвеченный код; тем же путём идут и `notify` —
+см. [`docs/specs/2026-07-29-rich-messages.md`](docs/specs/2026-07-29-rich-messages.md);
+живой пузырь `Thinking…` из той спеки убран — раздражал, состояние теперь в `/sessions`:
+`⚡ время · токены`, `🔐 ждёт аппрув`, кнопка 🔄 обновить),
 **многопользовательский доступ** (список `access.json` + `/allow`/`/deny`/`/who`: люди из
 списка работают с ботом в групповых чатах, вывод и аппрувы остаются в личке владельца —
 см. [`docs/specs/2026-07-29-group-allowlist.md`](docs/specs/2026-07-29-group-allowlist.md)).

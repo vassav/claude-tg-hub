@@ -2,7 +2,8 @@
 // Unit test for routing.mjs — pure state and formatting, no I/O.
 // Run from repo root:  node tg-hub/routing-test.mjs
 import assert from 'node:assert/strict';
-import { createActive, createPending, buttonLabel, projectOf, groupSessions, stripActiveMark, PENDING_TTL_MS } from './routing.mjs';
+import { createActive, createPending, buttonLabel, projectOf, groupSessions, stripActiveMark, PENDING_TTL_MS,
+  sessionState, stateMark, fmtDur, fmtTokens, WORK_TTL_MS } from './routing.mjs';
 
 let n = 0; const ok = m => { n++; console.log('  ✓', m); };
 
@@ -93,5 +94,37 @@ for (const s of live) {                                          // и без г
   assert.equal(found.id, s.id, `круг без галочки для ${s.id}`);
 }
 ok('круговой разбор нижней клавиатуры: метка ↔ тап, похожие метки не путаются');
+
+// 7. что сессия делает прямо сейчас — для отметки в /sessions
+assert.equal(sessionState({}), 'idle', 'без хода — простаивает');
+assert.equal(sessionState({ since: 1000, now: 1500 }), 'work', 'ход начат недавно — работает');
+assert.equal(sessionState({ since: 1000, now: 1000 + WORK_TTL_MS }), 'idle', 'ход без единого сигнала дольше ttl — уже не работает');
+assert.equal(sessionState({ since: 1000, now: 1000 + WORK_TTL_MS - 1 }), 'work', 'на границе ttl ещё работает');
+assert.equal(sessionState({ since: 1000, now: 1500, awaitingPerm: true }), 'perm', 'ожидание аппрува важнее работы');
+assert.equal(sessionState({ awaitingPerm: true }), 'perm', 'аппрув без начатого хода — тоже ожидание');
+assert.equal(sessionState({ since: 1000, now: 1500, ttlMs: 100 }), 'idle', 'ttl настраивается');
+assert.equal(stateMark('work'), '⚡');
+assert.equal(stateMark('perm'), '🔐');
+assert.equal(stateMark('idle'), '', 'простой не рисует ничего');
+assert.equal(WORK_TTL_MS, 600000);
+ok('sessionState: работа / ожидание аппрува / простой, ход протухает по ttl');
+
+// 8. длительность хода
+assert.equal(fmtDur(0), '0 с');
+assert.equal(fmtDur(42_000), '42 с');
+assert.equal(fmtDur(59_999), '59 с', 'округление вниз, минуты не появляются раньше времени');
+assert.equal(fmtDur(60_000), '1 м 00 с');
+assert.equal(fmtDur(187_000), '3 м 07 с', 'секунды дополняются нулём');
+assert.equal(fmtDur(-5), '0 с', 'часы назад не уводят в минус');
+ok('fmtDur: секунды до минуты, дальше «м с» с ведущим нулём');
+
+// 9. токены текущего хода
+assert.equal(fmtTokens(0), '0');
+assert.equal(fmtTokens(820), '820');
+assert.equal(fmtTokens(999), '999');
+assert.equal(fmtTokens(1000), '1.0k', 'с тысячи — в k');
+assert.equal(fmtTokens(3437), '3.4k');
+assert.equal(fmtTokens(undefined), '0', 'channels-сессия не отдаёт usage — не роняемся');
+ok('fmtTokens: сотни как есть, тысячи в k, пустое значение безопасно');
 
 console.log(`\n✅ routing-test: ${n} групп проверок пройдено`);
