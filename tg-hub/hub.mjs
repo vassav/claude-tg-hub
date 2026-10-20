@@ -942,6 +942,18 @@ for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt', 'browser'
     sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
   });
 }
+// /model <name> — switch the active stream session's model mid-conversation (control
+// set_model). The engine resolves aliases itself, so `opus`/`sonnet` mean whatever its
+// version maps them to; `default` goes back to the session's start model.
+bot.command('model', async ctx => {
+  if (!owns(ctx)) return;
+  const model = (ctx.match || '').trim();
+  if (!model) { await ctx.reply('usage: /model <модель>\nнапр. /model opus · /model claude-opus-5-5 · /model sonnet · /model default'); return; }
+  const id = activeIn(ctx);
+  if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
+  if (!isStream(id)) { await ctx.reply('⚙️ доступно только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
+  sendToSession(id, { t: 'command', name: 'model', arg: model, chat_id: String(ctx.chat.id) });
+});
 
 bot.on('callback_query:data', async ctx => {
   if (!owns(ctx)) { await ctx.answerCallbackQuery().catch(() => {}); return; }

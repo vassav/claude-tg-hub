@@ -3,15 +3,34 @@
 // conversation (claude --resume <id>). Used by both launch.mjs and hub.mjs.
 import pty from 'node-pty';
 import { spawn } from 'node:child_process';
-import { writeFileSync, mkdirSync, existsSync, appendFileSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, appendFileSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-const CLAUDE = process.env.CLAUDE_BIN || (process.platform === 'win32'
+const NPM_CLAUDE = process.platform === 'win32'
   ? 'C:\\Users\\vsavinov\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe'
-  : 'claude');
+  : 'claude';
+// The engine binary. CLAUDE_BIN wins; otherwise the newest VS Code extension's bundled
+// one — it updates with the extension, while the npm global goes stale (2.1.216 here
+// knew no Opus 5.5 and resolved `opus` to 4.x). Resolved per spawn, so an extension
+// update reaches the next session without restarting the hub.
+export function claudeBin() {
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+  try {
+    const root = join(homedir(), '.vscode', 'extensions');
+    const ver = n => (/^anthropic\.claude-code-(\d+)\.(\d+)\.(\d+)/.exec(n) || []).slice(1).map(Number);
+    const newer = (a, b) => { const x = ver(a), y = ver(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
+    const exe = process.platform === 'win32' ? 'claude.exe' : 'claude';
+    for (const d of readdirSync(root).filter(n => ver(n).length === 3).sort(newer)) {
+      const p = join(root, d, 'resources', 'native-binary', exe);
+      if (existsSync(p)) return p;
+    }
+  } catch {}
+  return NPM_CLAUDE;
+}
 
 // id          — our hub-side key for the shim (SESSION_ID); for managed sessions
 //               this equals the claude conversation UUID
@@ -53,7 +72,7 @@ export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir,
   try { writeFileSync(ptyLog, ''); } catch {}
   try { rmSync(shimLog, { force: true }); } catch {} // so existsSync is true only once the NEW shim starts
 
-  const p = pty.spawn(CLAUDE, args, { name: 'xterm-256color', cols: 120, rows: 40, cwd, env: childEnv });
+  const p = pty.spawn(claudeBin(), args, { name: 'xterm-256color', cols: 120, rows: 40, cwd, env: childEnv });
   p.onData(d => { try { appendFileSync(ptyLog, d); } catch {} });
 
   // Auto-confirm startup prompts (folder trust, dev-channels warning) by pressing
@@ -93,5 +112,7 @@ function spawnStreamSession({ id, cwd, resumeId, sessionUuid, tmpDir, hubPort, h
   delete childEnv.HUB_BOT_TOKEN; // sessions don't need the bot secret (HUB_OWNER_ID stays for reply fallback)
 
   const headless = join(HERE, 'panel', 'headless.mjs');
-  return spawn(process.execPath, [headless, CLAUDE, ...sjArgs], { stdio: ['ignore', 'inherit', 'inherit'], cwd, env: childEnv });
+  // detached: on Windows a non-detached child lands in libuv's kill-on-close job, so the
+  // whole session died with the hub. Detached, it outlives a hub restart and re-registers.
+  return spawn(process.execPath, [headless, claudeBin(), ...sjArgs], { stdio: ['ignore', 'inherit', 'inherit'], cwd, env: childEnv, detached: true, windowsHide: true });
 }

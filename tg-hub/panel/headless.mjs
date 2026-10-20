@@ -71,7 +71,7 @@ function onHub(m) {
   } else if (m.t === 'permission_decision') {
     resolveApproval(m.request_id, m.behavior, m.answers, m.message, m.suggestion);
   } else if (m.t === 'command') {
-    cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || OWNER || ''));
+    cmds.handle(String(m.name || ''), String(m.chat_id || boundChatId || OWNER || ''), m.arg);
   } else if (m.t === 'stop') {
     log('stop -> killing engine', { pid: child?.pid });
     try { child.kill(); } catch {}

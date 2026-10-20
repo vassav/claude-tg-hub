@@ -6,6 +6,7 @@
 //   /limits    -> control_request{get_usage}          -> rate_limits (5h + weekly %)
 //   /interrupt -> control_request{interrupt}
 //   /compact   -> injected as a user-turn (/compact)   [caller-supplied injectUser]
+//   /model X   -> control_request{set_model, model: X}
 import { randomUUID } from 'node:crypto';
 
 // Chrome MCP bridge = the engine binary itself with a flag — exactly the config
@@ -56,7 +57,7 @@ export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser
   function issue(subtype, extra, kind, chat_id, done) {
     const request_id = 'tg_' + randomUUID().slice(0, 12);
     const timer = setTimeout(() => { if (pending.delete(request_id)) { replyTo(chat_id, '⚠️ сессия не ответила на запрос'); done?.(false); } }, 8000);
-    pending.set(request_id, { kind, chat_id, timer, done });
+    pending.set(request_id, { kind, chat_id, timer, done, extra });
     toEngine({ type: 'control_request', request_id, request: { subtype, ...(extra || {}) } });
   }
   // /browser: register claude-in-chrome via mcp_set_servers (REPLACES the whole
@@ -68,8 +69,9 @@ export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser
   }
 
   return {
-    handle(name, chat_id) {
+    handle(name, chat_id, arg) {
       switch (name) {
+        case 'model': return issue('set_model', { model: String(arg || '').trim() || 'default' }, 'model', chat_id);
         case 'context': return issue('get_context_usage', {}, 'context', chat_id);
         case 'rc': case 'remote_control': return issue('remote_control', { enabled: true }, 'rc', chat_id);
         case 'limits': return issue('get_usage', {}, 'usage', chat_id);
@@ -100,6 +102,9 @@ export function createCommands({ toEngine, sendHub, sessionId, owner, injectUser
       if (pc.kind === 'context') replyTo(pc.chat_id, fmtContext(r));
       else if (pc.kind === 'rc') replyTo(pc.chat_id, r.session_url ? `🌐 Remote control:\n${r.session_url}\n\nОткрой ссылку на телефоне / в claude.ai, чтобы продолжить сессию.` : '⚠️ не удалось включить remote-control');
       else if (pc.kind === 'usage') replyTo(pc.chat_id, fmtUsage(r));
+      else if (pc.kind === 'model') replyTo(pc.chat_id, o.response?.subtype === 'error'
+        ? `⚠️ модель не сменилась: ${o.response.error || 'error'}`
+        : `🧠 модель: ${pc.extra.model} — со следующего хода`);
       else if (pc.kind === 'browser') {
         const errMap = r.errors && Object.keys(r.errors).length ? Object.entries(r.errors).map(([k, v]) => `${k}: ${v}`).join('; ') : '';
         const err = o.response?.subtype === 'error' ? String(o.response.error || 'error') : errMap;
