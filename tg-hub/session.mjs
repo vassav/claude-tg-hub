@@ -112,7 +112,5 @@ function spawnStreamSession({ id, cwd, resumeId, sessionUuid, tmpDir, hubPort, h
   delete childEnv.HUB_BOT_TOKEN; // sessions don't need the bot secret (HUB_OWNER_ID stays for reply fallback)
 
   const headless = join(HERE, 'panel', 'headless.mjs');
-  // detached: on Windows a non-detached child lands in libuv's kill-on-close job, so the
-  // whole session died with the hub. Detached, it outlives a hub restart and re-registers.
-  return spawn(process.execPath, [headless, claudeBin(), ...sjArgs], { stdio: ['ignore', 'inherit', 'inherit'], cwd, env: childEnv, detached: true, windowsHide: true });
+  return spawn(process.execPath, [headless, claudeBin(), ...sjArgs], { stdio: ['ignore', 'inherit', 'inherit'], cwd, env: childEnv });
 }
