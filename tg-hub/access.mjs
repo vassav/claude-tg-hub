@@ -4,14 +4,15 @@
 // only the people the owner let in. Format and durability mirror registry.json:
 // atomic write (tmp -> fsync -> rename), tolerant read (missing = empty, corrupt =
 // backed up and empty), so a broken file degrades to "owner only", never to "open".
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, relative, isAbsolute } from 'node:path';
 import { mkdirSync, readFileSync, renameSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 
-const DIR = join(homedir(), '.claude', 'channels', 'hub');
-const FILE = join(DIR, 'access.json');
+// The hub's state dir, set by init(): it comes from the hub's config, which is read only
+// after this module has been imported.
+let DIR = null, FILE = null;
 const users = new Map();   // id(string) -> { id, name, role, added, by }
 
+export function init(dir) { DIR = dir; FILE = join(dir, 'access.json'); reload(); }
 export function reload() {
   users.clear();
   let raw;
@@ -69,4 +70,15 @@ export function parseTarget(arg, replyFrom) {
   return m ? { id: m[1], name: (m[2] || m[1]).trim() } : null;
 }
 
-reload();
+// Project roots (HUB_PROJECTS): a cwd is allowed when it is a root or lies inside one; no
+// roots = everything. path.relative compares case-insensitively on Windows and yields an
+// absolute path across drives, so both are handled by the same test.
+export function inRoots(cwd, roots) {
+  if (!roots?.length) return true;
+  if (!cwd) return false;
+  const abs = resolve(cwd);
+  return roots.some(root => {
+    const r = relative(root, abs);
+    return r === '' || (!isAbsolute(r) && r.split(/[\\/]/)[0] !== '..');
+  });
+}

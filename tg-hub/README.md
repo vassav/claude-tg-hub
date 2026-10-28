@@ -16,7 +16,10 @@ HUB_BOT_TOKEN=...      # бот хаба (@my_local_claud_bot)
 HUB_OWNER_ID=...       # твой Telegram user id (allowlist)
 HUB_PORT=8799          # локальный IPC
 HUB_TOKEN=...          # секрет shim↔hub
+HUB_STATE_DIR=...      # опц.: папка registry/access/hub.json (по умолчанию ~/.claude/channels/hub)
+HUB_PROJECTS=...       # опц.: папки проектов боту, через `;` (по умолчанию — все)
 ```
+Другой файл настроек — `node hub.mjs --config <файл>` (второй бот на той же машине, см. корневой README).
 
 ## Запуск
 ```powershell

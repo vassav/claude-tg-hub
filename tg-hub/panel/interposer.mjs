@@ -66,7 +66,8 @@ function discover() {
   let token = process.env.HUB_TOKEN || '';
   if (!port || !token) {
     try {
-      const cfg = JSON.parse(readFileSync(join(homedir(), '.claude', 'channels', 'hub', 'hub.json'), 'utf8'));
+      const dir = process.env.HUB_STATE_DIR || join(homedir(), '.claude', 'channels', 'hub');   // which hub, when several run
+      const cfg = JSON.parse(readFileSync(join(dir, 'hub.json'), 'utf8'));
       if (!port) port = Number(cfg.port) || 0;
       if (!token) token = cfg.token || '';
     } catch {}

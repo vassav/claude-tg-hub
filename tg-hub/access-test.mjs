@@ -1,17 +1,15 @@
 // tg-hub/access-test.mjs
-// Unit test for access.mjs — no network, no Telegram. Redirects HOME/USERPROFILE to a
-// temp dir BEFORE importing the module, so the real ~/.claude/channels/hub is untouched.
+// Unit test for access.mjs — no network, no Telegram. Points the module at a temp
+// state dir, so the real ~/.claude/channels/hub is untouched.
 // Run from repo root:  node tg-hub/access-test.mjs
 import { mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
+import * as access from './access.mjs';
 
-const HOME = mkdtempSync(join(tmpdir(), 'access-test-'));
-process.env.HOME = HOME; process.env.USERPROFILE = HOME;   // must happen BEFORE the import below
-const CFG = join(HOME, '.claude', 'channels', 'hub');
-
-const access = await import('./access.mjs');
+const CFG = join(mkdtempSync(join(tmpdir(), 'access-test-')), 'hub');   // not created yet: save() must make it
+access.init(CFG);
 let n = 0; const ok = m => { n++; console.log('  ✓', m); };
 
 // 1. пустой старт — файла нет
@@ -87,5 +85,25 @@ assert.deepEqual(access.parseTarget('42', null), { id: '42', name: '42' });
 assert.equal(access.parseTarget('не число', null), null);
 assert.equal(access.parseTarget('', null), null);
 ok('parseTarget: реплай, "<id> имя", "<id>", мусор');
+
+// 8. inRoots
+assert.equal(access.inRoots('D:\\Anything', []), true, 'без корней — всё');
+assert.equal(access.inRoots('', ['D:\\Work']), false, 'пустой cwd при корнях — нет');
+if (process.platform === 'win32') {
+  const roots = ['D:\\Work', 'E:\\Lab\\'];
+  assert.equal(access.inRoots('D:\\Work', roots), true, 'сам корень');
+  assert.equal(access.inRoots('d:/work/proj/sub', roots), true, 'внутри, другой регистр и слэши');
+  assert.equal(access.inRoots('E:\\Lab\\x', roots), true, 'второй корень, корень со слэшем на конце');
+  assert.equal(access.inRoots('D:\\Workshop', roots), false, 'соседняя папка с общим префиксом');
+  assert.equal(access.inRoots('D:\\Work\\..\\Other', roots), false, 'выход через ..');
+  assert.equal(access.inRoots('D:\\Work\\..foo', roots), true, 'папка, начинающаяся с ..');
+  assert.equal(access.inRoots('C:\\Work', roots), false, 'другой диск');
+} else {
+  const roots = ['/work', '/lab/'];
+  assert.equal(access.inRoots('/work/proj', roots), true, 'внутри');
+  assert.equal(access.inRoots('/workshop', roots), false, 'общий префикс');
+  assert.equal(access.inRoots('/work/../etc', roots), false, 'выход через ..');
+}
+ok('inRoots: корень, вложенность, регистр, префикс, .., диск');
 
 console.log(`\n✅ access-test: ${n} групп проверок пройдено`);

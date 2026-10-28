@@ -15,9 +15,9 @@
 //     full conversation. A resume is NEVER offered/spawned while the original
 //     process is still alive (PID liveness), so we never double-write one .jsonl.
 import { fileURLToPath } from 'node:url';
-import { dirname, join, basename, isAbsolute } from 'node:path';
+import { dirname, join, basename, isAbsolute, resolve, delimiter } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync, copyFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, renameSync, existsSync, openSync, readSync, writeSync, fsyncSync, closeSync, copyFileSync } from 'node:fs';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
@@ -31,7 +31,20 @@ import { createActive, createPending, buttonLabel, groupSessions, stripActiveMar
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
-dotenv.config({ path: join(ROOT, '.env') });
+// Config: `node hub.mjs --config <file>` reads a .env-style file instead of the repo's .env,
+// so several hubs (one bot each) can run side by side. An explicit file wins over the
+// inherited environment: a hub started from inside a hub-managed session would otherwise
+// pick up that hub's HUB_BOT_TOKEN/HUB_PORT.
+function configArg(argv) {
+  const i = argv.findIndex(a => a === '--config' || a.startsWith('--config='));
+  if (i < 0) return null;
+  const v = argv[i].includes('=') ? argv[i].slice(argv[i].indexOf('=') + 1) : argv[i + 1];
+  if (!v) { console.error('[hub] --config needs a file path'); process.exit(1); }
+  return resolve(v);
+}
+const CONFIG = configArg(process.argv.slice(2));
+if (CONFIG && !existsSync(CONFIG)) { console.error(`[hub] config not found: ${CONFIG}`); process.exit(1); }
+dotenv.config({ path: CONFIG || join(ROOT, '.env'), override: !!CONFIG });
 
 const TOKEN = process.env.HUB_BOT_TOKEN;
 const OWNER = String(process.env.HUB_OWNER_ID || '');
@@ -50,7 +63,20 @@ const TMP = process.env.HUB_TMP_DIR || (process.platform === 'win32'
   ? 'C:\\Users\\vsavinov\\AppData\\Local\\Temp\\hubsessions'
   : join(tmpdir(), 'hubsessions'));
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
-const HUB_CFG_DIR = join(homedir(), '.claude', 'channels', 'hub');
+const CONFIG_DIR = dirname(CONFIG || join(ROOT, '.env'));   // relative paths in the config are taken from here
+// Per-instance state: registry.json, access.json, hub.json. A second hub needs its own
+// HUB_STATE_DIR.
+const HUB_CFG_DIR = process.env.HUB_STATE_DIR
+  ? resolve(CONFIG_DIR, process.env.HUB_STATE_DIR)
+  : join(homedir(), '.claude', 'channels', 'hub');
+if (process.env.HUB_STATE_DIR) process.env.HUB_STATE_DIR = HUB_CFG_DIR;   // children inherit it absolute
+// HUB_PROJECTS: the folders this bot may work in, separated by `;` (`:` off Windows).
+// Unset = every project. Limits /projects, every way of starting a session and which
+// self-joining sessions (plugin, VSCode panel) are let in.
+const PROJECT_ROOTS = String(process.env.HUB_PROJECTS || '').split(delimiter)
+  .map(s => s.trim()).filter(Boolean).map(p => resolve(CONFIG_DIR, p));
+for (const r of PROJECT_ROOTS) if (!existsSync(r)) console.error(`[hub] HUB_PROJECTS: ${r} does not exist`);
+const inProjects = cwd => access.inRoots(cwd, PROJECT_ROOTS);
 const REG_FILE = join(HUB_CFG_DIR, 'registry.json');
 const GRACE_MS = 8000;                       // after startup, let survivors reconnect before reporting resumables
 const JANITOR_MS = 30000;                     // periodic reconcile/cleanup
@@ -61,10 +87,33 @@ const TITLE_TIMEOUT_MS = 20000;               // wait this long for the model's 
 if (!TOKEN) { console.error('HUB_BOT_TOKEN missing in .env'); process.exit(1); }
 if (!OWNER) { console.error('HUB_OWNER_ID missing in .env'); process.exit(1); }
 
+// One hub per state dir: two would overwrite each other's registry.json and hub.json.
+// The hub.json there counts as taken when its port answers and its pid (absent in files
+// written before pids were recorded) is alive — after a reboot the pid may belong to
+// someone else, but then nothing listens on the port. Checked before anything is read
+// or written, as is our own port, so a misconfigured second hub leaves no trace.
+function portAnswers(port) {
+  return new Promise(res => {
+    const s = net.connect({ host: '127.0.0.1', port }, () => { s.destroy(); res(true); });
+    s.on('error', () => res(false));
+    s.setTimeout(1000, () => { s.destroy(); res(false); });
+  });
+}
+{
+  let prev = null;
+  try { prev = JSON.parse(readFileSync(join(HUB_CFG_DIR, 'hub.json'), 'utf8')); } catch {}
+  if (prev?.port && (!prev.pid || isAlive(prev.pid)) && await portAnswers(prev.port)) {
+    console.error(`[hub] ${HUB_CFG_DIR} is in use by another hub (pid ${prev.pid ?? '?'}, port ${prev.port}) — give this one its own HUB_STATE_DIR`);
+    process.exit(1);
+  }
+  if (await portAnswers(PORT)) { console.error(`[hub] port ${PORT} is busy — set another HUB_PORT`); process.exit(1); }
+}
+access.init(HUB_CFG_DIR);
+
 // Discovery: write hub address+token so plugin-launched shims (no env) can find us.
 try {
   mkdirSync(HUB_CFG_DIR, { recursive: true });
-  writeFileSync(join(HUB_CFG_DIR, 'hub.json'), JSON.stringify({ port: PORT, token: IPC_TOKEN }));
+  writeFileSync(join(HUB_CFG_DIR, 'hub.json'), JSON.stringify({ port: PORT, token: IPC_TOKEN, pid: process.pid }));
 } catch (e) { console.error('[hub] discovery config write failed:', e?.message); }
 
 const bot = new Bot(TOKEN, { client: { apiRoot: API_ROOT } });
@@ -491,6 +540,7 @@ const fileMime = msg => msg.document?.mime_type || msg.audio?.mime_type || msg.v
 function startSession(cwd, { resumeUuid, chatId, extraMcpServers, extraAllowedTools } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
+  if (!inProjects(cwd)) { notify(`⛔ ${cwd} is outside this bot's projects (HUB_PROJECTS)`); return null; }
   if (sessions.has(id) || pendingActivate.has(id)) { notify(`already running: ${labelOf(id)}`); return null; }
   if (isOwnLive(e0)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return null; }
   if (resumeUuid) {
@@ -541,7 +591,11 @@ function shortCwd(cwd) { return cwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter
 function readMeta(file) {
   let cwd = '', title = '';
   try {
-    const head = readFileSync(file, 'utf8').slice(0, 40000);
+    // Only the head: transcripts run to tens of MB, and HUB_PROJECTS reads one per project
+    // on every /projects. 160 KB always holds the first 40000 chars, even at 4 bytes each.
+    const buf = Buffer.alloc(160000), fd = openSync(file, 'r');
+    let n; try { n = readSync(fd, buf, 0, buf.length, 0); } finally { closeSync(fd); }
+    const head = buf.toString('utf8', 0, n).slice(0, 40000);
     for (const line of head.split('\n')) {
       if (!line.trim()) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
@@ -586,13 +640,17 @@ function listProjects() {
       const full = join(dir, f);
       let st; try { st = statSync(full); } catch { continue; }
       if (st.size < 80) continue; // skip empty/near-empty
-      const id = f.replace(/\.jsonl$/, '');
-      ss.push({ id, mtime: st.mtimeMs });
-      idToDir.set(id, d);
+      ss.push({ id: f.replace(/\.jsonl$/, ''), mtime: st.mtimeMs });
     }
     if (!ss.length) continue;
     ss.sort((a, b) => b.mtime - a.mtime);
-    byDir.push({ dir: d, sessions: ss, latest: ss[0].mtime });
+    const p = { dir: d, sessions: ss, latest: ss[0].mtime };
+    if (PROJECT_ROOTS.length) {                       // the folder name encodes cwd lossily — read the real one
+      p.cwd = readMeta(join(dir, ss[0].id + '.jsonl')).cwd;
+      if (!inProjects(p.cwd)) continue;
+    }
+    for (const s of ss) idToDir.set(s.id, d);
+    byDir.push(p);
   }
   byDir.sort((a, b) => b.latest - a.latest);
   return byDir;
@@ -603,7 +661,7 @@ function projectsKeyboard() {
   lastProjects = listProjects();
   const kb = new InlineKeyboard();
   lastProjects.slice(0, 10).forEach((p, i) => {
-    const cwd = readMeta(join(PROJECTS_DIR, p.dir, p.sessions[0].id + '.jsonl')).cwd || p.dir;
+    const cwd = p.cwd || readMeta(join(PROJECTS_DIR, p.dir, p.sessions[0].id + '.jsonl')).cwd || p.dir;
     p.cwd = cwd;
     kb.text(`${shortCwd(cwd)} (${p.sessions.length}) · ${ago(p.latest)}`, `proj:${i}`).row();
   });
@@ -632,9 +690,10 @@ setTimeout(() => {
 
 // ── IPC: shims connect here ──────────────────────────────────────────────────
 net.createServer(sock => {
-  let buf = '', sid = null;
+  let buf = '', sid = null, refused = false;
   sock.setEncoding('utf8');
   sock.on('data', d => {
+    if (refused) return;
     buf += d; let i;
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
@@ -642,6 +701,13 @@ net.createServer(sock => {
       let m; try { m = JSON.parse(line); } catch { continue; }
       if (m.t === 'register') {
         if (m.token !== IPC_TOKEN) { sock.end(); return; }
+        if (!inProjects(m.cwd)) {
+          // Not this bot's project. Keep the socket but ignore it: on close the shim/panel
+          // reconnects every 2 s and would be refused again, forever.
+          refused = true;
+          console.error(`[hub] refused ${m.sessionId} in ${m.cwd}: outside HUB_PROJECTS`);
+          return;
+        }
         sid = m.sessionId;
         const known = registry.get(sid);
         const managed = known?.managed ?? pendingActivate.has(sid); // hub-started ones are pending/known
@@ -778,7 +844,7 @@ net.createServer(sock => {
         const cwd = m.resume ? (registry.get(m.resume)?.cwd || m.cwd) : m.cwd;
         if (!cwd) { sock.write(JSON.stringify({ ok: false, error: 'cwd required (or resume an unknown uuid)' }) + '\n'); return; }
         const newId = startSession(cwd, { resumeUuid: m.resume || undefined, extraMcpServers: m.extraMcpServers, extraAllowedTools: m.extraAllowedTools });
-        if (!newId) { sock.write(JSON.stringify({ ok: false, error: 'could not start (already running / history gone / cwd conflict)' }) + '\n'); return; }
+        if (!newId) { sock.write(JSON.stringify({ ok: false, error: 'could not start (already running / history gone / cwd conflict / outside HUB_PROJECTS)' }) + '\n'); return; }
         if (m.content != null && String(m.content) !== '') {
           const meta = { ...(m.meta || {}) };
           if (!meta.chat_id) meta.chat_id = CHAT;
@@ -841,7 +907,8 @@ net.createServer(sock => {
     notify(`⚠️ ${label} disconnected${resumable ? ' — resume via /sessions' : ''}`, { reply_markup: replyKeyboard(CHAT) });
   });
   sock.on('error', () => {});
-}).listen(PORT, '127.0.0.1', () => console.error(`[hub] IPC on 127.0.0.1:${PORT}`));
+}).on('error', e => { console.error(`[hub] IPC on ${PORT} failed: ${e?.message}`); process.exit(1); })
+  .listen(PORT, '127.0.0.1', () => console.error(`[hub] IPC on 127.0.0.1:${PORT}; state ${HUB_CFG_DIR}`));
 
 // ── Telegram ─────────────────────────────────────────────────────────────────
 // Access gate: the owner (in any chat, DM included) OR anyone on the access list —
