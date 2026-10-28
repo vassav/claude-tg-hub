@@ -87,6 +87,19 @@ export function spawnSession({ id, cwd, resumeId, sessionUuid, shimPath, tmpDir,
   return p;
 }
 
+// Has to outweigh the session's own history: one resumed from before the bridge took over
+// replies had read "hub not joined" and "server disconnected", and a softer wording lost.
+const STREAM_PROMPT = [
+  'This session is driven from Telegram through tg-hub. User turns are messages typed in a Telegram chat.',
+  'Every text answer you write here IS delivered to that chat, right now, by the bridge that runs this',
+  'session — this does not depend on any MCP server or tool, the hub server included, and it is true even',
+  'while servers are (re)connecting. So never tell the user you cannot write to them in Telegram: you are',
+  'doing it with this very answer. There is no reply or set_title tool and none is needed; the session is',
+  'named for you. Anything earlier in this conversation saying the hub disconnected or "hub not joined" is',
+  'about those two tools only and is outdated. To send a file or picture use the hub send_file tool; for a',
+  'standalone ping, notify. The user may not be at this computer.',
+].join(' ');
+
 // Variant A: spawn `node headless.mjs <claude> <stream-json args>`. The headless
 // client spawns claude in stream-json (pipes, no PTY, no channels/shim), does the
 // initialize handshake and bridges the session into the hub — so control-protocol
@@ -105,6 +118,10 @@ function spawnStreamSession({ id, cwd, resumeId, sessionUuid, tmpDir, hubPort, h
   }
   const extra = Array.isArray(extraAllowedTools) ? extraAllowedTools.join(',') : (extraAllowedTools || '');
   if (extra) sjArgs.push('--allowedTools', extra); // default empty → all tools gated via approval
+  // The model can't tell on its own that its plain text reaches Telegram: here it has no
+  // reply tool (the bridge mirrors answers), and a session from before that change was told
+  // the hub server "disconnected" — it then insisted it couldn't write to the user at all.
+  sjArgs.push('--append-system-prompt', STREAM_PROMPT);
   if (resumeId) sjArgs.push('--resume', resumeId);
   else if (sessionUuid) sjArgs.push('--session-id', sessionUuid);
 
