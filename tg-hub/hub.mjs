@@ -353,6 +353,21 @@ async function sendTg(chatId, text, sid, extra = {}, firstExtra = {}) {
   }
   return last;
 }
+// Send an approval/question card to `chat` and remember where it landed (permMsg, for
+// clearing its buttons). sendTg swallows failures and returns null: if a group is gone,
+// migrated to a new id, or the bot is restricted there, the card would render nowhere
+// while the request stays pending — a card nobody can see hangs the session. Then
+// re-send to the home chat; `onMoved(CHAT)` lets the caller repoint its own state.
+function sendCard(rid, sid, chat, text, kb, onMoved) {
+  sendTg(chat, text, sid, { reply_markup: kb }).then(sent => {
+    if (sent?.message_id) { permMsg.set(rid, { mid: sent.message_id, chat }); return; }
+    if (chat === CHAT) return;                       // already the home chat — nothing left to fall back to
+    onMoved?.(CHAT);
+    sendTg(CHAT, text, sid, { reply_markup: kb }).then(sent2 => {
+      if (sent2?.message_id) permMsg.set(rid, { mid: sent2.message_id, chat: CHAT });
+    });
+  });
+}
 // Session answers go out as Rich Messages: the model's Markdown is handed to Telegram
 // untouched, which renders real tables, headings and syntax-highlighted code. Falls back to
 // the HTML path on ANY failure — an old self-hosted Bot API server (TELEGRAM_API_ROOT), a
@@ -783,34 +798,22 @@ net.createServer(sock => {
       } else if (m.t === 'permission_request') {
         clearWorking(m.sessionId);   // not working — waiting on a human; the list says 🔐 while pendingPerm holds it
         pendingPerm.set(m.request_id, m.sessionId);
+        // Both kinds of card belong where the request came from: a person driving the session
+        // from a group must be able to answer there, or the session waits for nobody.
+        const cardChat = askChatFor(lastInbound.get(m.sessionId), CHAT);
         if (m.ask) {                                   // stream path: structural questions -> option buttons
-          // The card belongs where the question came from: a person asking from a group
-          // must be able to answer it there. Approvals below stay in CHAT (owner's DM).
-          const askChat = askChatFor(lastInbound.get(m.sessionId), CHAT);
-          askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0, chatId: askChat });
+          askState.set(m.request_id, { sessionId: m.sessionId, qs: m.ask, picks: m.ask.questions.map(() => []), cur: 0, chatId: cardChat });
           const c = askCard(m.request_id);
-          sendTg(askChat, c.text, m.sessionId, { reply_markup: c.kb }).then(sent => {
-            if (sent?.message_id) { permMsg.set(m.request_id, { mid: sent.message_id, chat: askChat }); return; }
-            if (askChat === CHAT) return; // already tried the owner's DM — nothing left to fall back to
-            // sendTg swallows failures and returns null; if the group chat is gone, migrated
-            // to a new id, or the bot is restricted there, the card would render nowhere
-            // while pendingPerm/askState stay set — a card nobody can see hangs the session
-            // with no way to answer it. Re-send to the owner's DM and repoint askState so the
-            // four later editTg(st.chatId, …) sites (cancel, redraw, next question, summary)
-            // edit the chat that actually has the card.
-            const st = askState.get(m.request_id);
-            if (st) st.chatId = CHAT;
-            sendTg(CHAT, c.text, m.sessionId, { reply_markup: c.kb }).then(sent2 => {
-              if (sent2?.message_id) permMsg.set(m.request_id, { mid: sent2.message_id, chat: CHAT });
-            });
-          });
+          // Moved to the home chat → repoint askState, so the four later editTg(st.chatId, …)
+          // sites (cancel, redraw, next question, summary) edit the chat that has the card.
+          sendCard(m.request_id, m.sessionId, cardChat, c.text, c.kb, chat => { const st = askState.get(m.request_id); if (st) st.chatId = chat; });
         } else {                                       // channels (or any other tool): Allow/Deny as before
           const kb = new InlineKeyboard().text('✅ Allow', `perm:${m.request_id}:allow`).text('❌ Deny', `perm:${m.request_id}:deny`).row();
           // …plus the engine's own "don't ask again" offers (stream sessions only)
           (m.suggestions || []).slice(0, 4).forEach((s, i) => kb.text(btnLabel(suggestLabel(s)), `psug:${m.request_id}:${i}`).row());
           const pv = (m.input_preview && askDigest(m.tool_name, m.input_preview)) || m.input_preview;
           const body = `🔐 [${labelOf(m.sessionId)}] ${m.tool_name}` + (m.description ? `\n${m.description}` : '') + (pv ? `\n${pv}` : '');
-          sendTg(CHAT, body, m.sessionId, { reply_markup: kb }).then(sent => { if (sent?.message_id) permMsg.set(m.request_id, { mid: sent.message_id, chat: CHAT }); });
+          sendCard(m.request_id, m.sessionId, cardChat, body, kb);
         }
       } else if (m.t === 'approval_cancel') {
         // The session answered this approval elsewhere (e.g. in the VSCode panel) —
