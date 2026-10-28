@@ -25,7 +25,7 @@ import { Bot, InlineKeyboard, Keyboard, InputFile } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
-import { replyExtra, askChatFor, nextInbound, isGroup } from './chat-target.mjs';
+import { replyExtra, askChatFor, nextInbound, isGroup, placeOf, splitPlace } from './chat-target.mjs';
 import { sendRich, RICH_LIMIT, chooseFileMethod, CAPTION_LIMIT } from './rich.mjs';
 import { createActive, createPending, buttonLabel, groupSessions, stripActiveMark, sessionState, stateMark, fmtDur, fmtTokens } from './routing.mjs';
 
@@ -130,7 +130,9 @@ const lastInbound = new Map();  // sessionId -> { chat_id, message_id, user, use
 const working = new Map();    // sessionId -> { since, tokens } of the running turn
 const active = createActive();                 // chatId -> sessionId; no global pointer
 const pending = createPending();   // chatId -> text written before the chat had an active session
-const activeIn = ctx => active.get(ctx.chat?.id);
+// Where this update lives: the chat, or the forum topic inside it (see chat-target.mjs).
+const here = ctx => placeOf(ctx.chat, ctx.msg);
+const activeIn = ctx => active.get(here(ctx));
 const pendingActivate = new Map(); // sessionId -> chatId that asked for it (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
 const awaitingTitle = new Set();   // ids whose meaningful name we're awaiting (model set_title, else slug fallback)
@@ -266,7 +268,7 @@ function armAutoName(id, body) {
     applyName(id, text, false);
   }, TITLE_TIMEOUT_MS);
 }
-const notify = (text, extra) => bot.api.sendMessage(CHAT, text, extra).catch(() => {});
+const notify = (text, extra) => { const { chat, thread } = splitPlace(CHAT); return bot.api.sendMessage(chat, text, { ...thread, ...extra }).catch(() => {}); };
 function sendToSession(id, obj) {
   const s = sessions.get(id); if (!s?.conn) return false;
   s.conn.write(JSON.stringify(obj) + '\n');
@@ -344,14 +346,15 @@ function chunkText(s, n = 4000) {
   return out;
 }
 async function sendTg(chatId, text, sid, extra = {}, firstExtra = {}) {
+  const { chat, thread } = splitPlace(chatId);
   const parts = chunkText(String(text ?? ''));
   let last = null;
   for (let i = 0; i < parts.length; i++) {
     // keyboard only on the last chunk; reply-quote only on the first
-    const opts = { link_preview_options: { is_disabled: true }, ...(i === 0 ? firstExtra : {}), ...(i === parts.length - 1 ? extra : {}) };
+    const opts = { link_preview_options: { is_disabled: true }, ...thread, ...(i === 0 ? firstExtra : {}), ...(i === parts.length - 1 ? extra : {}) };
     let sent = null;
-    try { sent = await bot.api.sendMessage(chatId, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
-    catch { try { sent = await bot.api.sendMessage(chatId, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
+    try { sent = await bot.api.sendMessage(chat, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
+    catch { try { sent = await bot.api.sendMessage(chat, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
     if (sent?.message_id && sid) outMsgToSession.set(sent.message_id, sid);
     if (sent) last = sent;
   }
@@ -380,7 +383,8 @@ function sendCard(rid, sid, chat, text, kb, onMoved) {
 async function sendMd(chatId, text, sid, extra = {}, firstExtra = {}) {
   const body = String(text ?? '');
   if (body.length <= RICH_LIMIT) {
-    const sent = await sendRich({ apiRoot: API_ROOT, token: TOKEN, chatId, markdown: body, extra: { ...firstExtra, ...extra } });
+    const { chat, thread } = splitPlace(chatId);
+    const sent = await sendRich({ apiRoot: API_ROOT, token: TOKEN, chatId: chat, markdown: body, extra: { ...thread, ...firstExtra, ...extra } });
     if (sent?.message_id) {
       if (sid) outMsgToSession.set(sent.message_id, sid);   // keep "reply to a bot message → its session" working
       return sent;
@@ -394,8 +398,9 @@ async function sendMd(chatId, text, sid, extra = {}, firstExtra = {}) {
 async function editTg(chatId, messageId, text, extra = {}) {
   const t = String(text ?? '');
   const opts = { link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] }, ...extra };
-  try { return await bot.api.editMessageText(chatId, messageId, mdToTgHtml(t), { parse_mode: 'HTML', ...opts }); }
-  catch { try { return await bot.api.editMessageText(chatId, messageId, t, opts); } catch (e) { console.error('editTg', e?.message); } }
+  const chat = splitPlace(chatId).chat;   // an edit addresses a message — its topic comes with it
+  try { return await bot.api.editMessageText(chat, messageId, mdToTgHtml(t), { parse_mode: 'HTML', ...opts }); }
+  catch { try { return await bot.api.editMessageText(chat, messageId, t, opts); } catch (e) { console.error('editTg', e?.message); } }
   return null;
 }
 
@@ -505,7 +510,7 @@ function sessionsText(chatId) {
 async function routeTo(ctx, id, body) {
   const meta = {
     // no message when a held text is delivered by a button tap — then there's nothing to quote
-    chat_id: String(ctx.chat.id), message_id: ctx.message ? String(ctx.message.message_id) : '',
+    chat_id: here(ctx), message_id: ctx.message ? String(ctx.message.message_id) : '',
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
   if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return false; }
@@ -715,7 +720,7 @@ async function newProject(ctx, arg, root) {
   const r = access.projectPath(arg, root ? [root] : PROJECT_ROOTS);
   if (r.error) { await ctx.reply(`⚠️ ${r.error}`); return; }
   if (r.pickRoot) {
-    newProjArg.set(ctx.chat.id, arg);
+    newProjArg.set(here(ctx), arg);
     const kb = new InlineKeyboard();
     PROJECT_ROOTS.forEach((p, i) => kb.text(p, `npr:${i}`).row());
     await ctx.reply(`Где создать «${arg.trim()}»?`, { reply_markup: kb });
@@ -727,7 +732,7 @@ async function newProject(ctx, arg, root) {
     catch (e) { await ctx.reply(`⚠️ не смог создать ${r.cwd}: ${e?.message || e}`); return; }
     await ctx.reply(`📁 создан проект ${r.cwd}`);
   }
-  if (startSession(r.cwd, { chatId: ctx.chat.id })) await ctx.reply(`➕ starting new session in ${r.cwd}…`);
+  if (startSession(r.cwd, { chatId: here(ctx) })) await ctx.reply(`➕ starting new session in ${r.cwd}…`);
 }
 
 // ── startup recovery ─────────────────────────────────────────────────────────
@@ -867,7 +872,7 @@ net.createServer(sock => {
         // drop the now-stale Telegram buttons.
         pendingPerm.delete(m.request_id); askState.delete(m.request_id);
         const card = permMsg.get(m.request_id); permMsg.delete(m.request_id);
-        if (card) bot.api.editMessageText(card.chat, card.mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
+        if (card) bot.api.editMessageText(splitPlace(card.chat).chat, card.mid, `🔐 [${labelOf(m.sessionId)}] ${m.tool || 'tool'} — ✅ обработано в панели`).catch(() => {});
       } else if (m.t === 'inject') {
         // External, programmatic inbound (a local consumer process, NOT a human in
         // Telegram). Authenticated like register; target is a live session's id or
@@ -928,12 +933,13 @@ net.createServer(sock => {
         // Markdown first, then render. An over-long caption rejects the whole upload.
         const cap = rawCap.slice(0, CAPTION_LIMIT);
         const opts = cap ? { caption: mdToTgHtml(cap), parse_mode: 'HTML' } : {};
-        bot.api[method](to, new InputFile(path), opts)
+        const { chat: toChat, thread: toThread } = splitPlace(to);
+        bot.api[method](toChat, new InputFile(path), { ...toThread, ...opts })
           .then(() => sock.write(JSON.stringify({ ok: true, method }) + '\n'))
           .catch(e => {
             // HTML caption rejected (bad entities) → retry once with the plain caption.
             const plainOpts = cap ? { caption: cap } : {};
-            bot.api[method](to, new InputFile(path), plainOpts)
+            bot.api[method](toChat, new InputFile(path), { ...toThread, ...plainOpts })
               .then(() => sock.write(JSON.stringify({ ok: true, method }) + '\n'))
               .catch(e2 => sock.write(JSON.stringify({ ok: false, error: (e2?.description || e2?.message || String(e2)) }) + '\n'));
           });
@@ -967,14 +973,14 @@ const owns = ctx => access.canUse(
   { userId: ctx.from?.id, chatType: ctx.chat?.type, isBot: ctx.from?.is_bot },
   { owner: OWNER });
 
-bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard(ctx.chat.id) }); });
+bot.command('start', async ctx => { if (!owns(ctx)) return; await ctx.reply('Hub ready. /sessions = live · /projects = history+resume', { reply_markup: replyKeyboard(here(ctx)) }); });
 
 // Discover a chat's id. Open to everyone in a GROUP (it reveals only the caller's own
 // id and the chat's) — that's how a newcomer can hand the owner their id. In a DM it
 // stays owner-only, like every other DM interaction.
 bot.command('id', async ctx => {
   if (ctx.chat?.type === 'private' && String(ctx.from?.id) !== OWNER) return;
-  await ctx.reply(`chat_id: ${ctx.chat.id}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`);
+  await ctx.reply(`chat_id: ${ctx.chat.id}${ctx.msg?.is_topic_message ? `\ntopic (message_thread_id): ${ctx.msg.message_thread_id}` : ''}\ntype: ${ctx.chat.type}\nyour user_id: ${ctx.from?.id}`);
 });
 
 // ── access list management (owner only) ──────────────────────────────────────
@@ -1027,10 +1033,10 @@ bot.command('who', async ctx => {
 bot.command('sessions', async ctx => {
   if (!owns(ctx)) return;
   const resumable = resumableEntries();
-  if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
-  await ctx.reply(sessionsText(ctx.chat.id), { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) });
+  if (!order.length && !resumable.length) { await ctx.reply('no live sessions. /projects to resume an old one.', { reply_markup: replyKeyboard(here(ctx)) }); return; }
+  await ctx.reply(sessionsText(here(ctx)), { parse_mode: 'HTML', reply_markup: sessionInline(here(ctx)) });
   await ctx.reply('⚡ работает · 🔐 ждёт аппрув · ● активная\nswitch ↓, resume ⏸, or reply to a session\'s message',
-    { reply_markup: replyKeyboard(ctx.chat.id) });
+    { reply_markup: replyKeyboard(here(ctx)) });
 });
 
 bot.command('projects', async ctx => {
@@ -1042,7 +1048,7 @@ bot.command('projects', async ctx => {
 bot.command('use', async ctx => {
   if (!owns(ctx)) return;
   const id = order.find(x => labelOf(x) === (ctx.match || '').trim() || x === (ctx.match || '').trim());
-  if (id) { active.set(ctx.chat.id, id); await ctx.reply(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); } else await ctx.reply('not found');
+  if (id) { active.set(here(ctx), id); await ctx.reply(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(here(ctx)) }); } else await ctx.reply('not found');
 });
 
 bot.command('stop', async ctx => {
@@ -1071,7 +1077,7 @@ for (const name of ['context', 'rc', 'limits', 'compact', 'interrupt', 'browser'
     const id = activeIn(ctx);
     if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
     if (!isStream(id)) { await ctx.reply('⚙️ доступно только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
-    sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
+    sendToSession(id, { t: 'command', name, chat_id: here(ctx) });
   });
 }
 // /model <name> — switch the active stream session's model mid-conversation (control
@@ -1084,7 +1090,7 @@ bot.command('model', async ctx => {
   const id = activeIn(ctx);
   if (!id || !sessions.has(id)) { await ctx.reply('нет активной сессии'); return; }
   if (!isStream(id)) { await ctx.reply('⚙️ доступно только для stream-сессий (панель VSCode / TG на stream-json)'); return; }
-  sendToSession(id, { t: 'command', name: 'model', arg: model, chat_id: String(ctx.chat.id) });
+  sendToSession(id, { t: 'command', name: 'model', arg: model, chat_id: here(ctx) });
 });
 
 bot.on('callback_query:data', async ctx => {
@@ -1095,7 +1101,7 @@ bot.on('callback_query:data', async ctx => {
   if (data === 'refresh') {
     // Redraw the list in place. Telegram rejects an edit that changes nothing ("message is
     // not modified"), and that is precisely the "nothing moved" case — say so on the toast.
-    await ctx.editMessageText(sessionsText(ctx.chat.id), { parse_mode: 'HTML', reply_markup: sessionInline(ctx.chat.id) })
+    await ctx.editMessageText(sessionsText(here(ctx)), { parse_mode: 'HTML', reply_markup: sessionInline(here(ctx)) })
       .then(() => ctx.answerCallbackQuery().catch(() => {}))
       .catch(() => ctx.answerCallbackQuery({ text: 'без изменений' }).catch(() => {}));
     return;
@@ -1104,12 +1110,12 @@ bot.on('callback_query:data', async ctx => {
   if ((m = /^switch:(.+)$/.exec(data))) {
     const id = m[1];
     if (sessions.has(id)) {
-      active.set(ctx.chat.id, id);
+      active.set(here(ctx), id);
       await ctx.answerCallbackQuery({ text: `active: ${labelOf(id)}` }).catch(() => {});
-      await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
+      await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(here(ctx)) }).catch(() => {});
       await notify(`▶ active: ${labelOf(id)}`, { reply_markup: replyKeyboard(CHAT) });
-      const held = pending.take(ctx.chat.id);
-      if (held) { if (!await routeTo(ctx, id, held)) pending.put(ctx.chat.id, held); }   // re-hold on delivery failure
+      const held = pending.take(here(ctx));
+      if (held) { if (!await routeTo(ctx, id, held)) pending.put(here(ctx), held); }   // re-hold on delivery failure
     } else await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {});
     return;
   }
@@ -1125,7 +1131,7 @@ bot.on('callback_query:data', async ctx => {
     const id = m[1];
     registry.delete(id); saveRegistry();
     await ctx.answerCallbackQuery({ text: 'forgotten' }).catch(() => {});
-    await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(ctx.chat.id) }).catch(() => {});
+    await ctx.editMessageReplyMarkup({ reply_markup: sessionInline(here(ctx)) }).catch(() => {});
     return;
   }
 
@@ -1133,7 +1139,7 @@ bot.on('callback_query:data', async ctx => {
     const [, id, name] = m;
     if (!sessions.has(id)) { await ctx.answerCallbackQuery({ text: 'session gone' }).catch(() => {}); return; }
     if (!isStream(id)) { await ctx.answerCallbackQuery({ text: 'только для stream-сессий' }).catch(() => {}); return; }
-    sendToSession(id, { t: 'command', name, chat_id: String(ctx.chat.id) });
+    sendToSession(id, { t: 'command', name, chat_id: here(ctx) });
     await ctx.answerCallbackQuery({ text: name }).catch(() => {});
     return;
   }
@@ -1239,7 +1245,7 @@ bot.on('callback_query:data', async ctx => {
     if (!cwd) { await ctx.answerCallbackQuery({ text: 'no cwd' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(cwd, { resumeUuid: id, chatId: ctx.chat.id }); // startSession enforces liveness/history guards
+    startSession(cwd, { resumeUuid: id, chatId: here(ctx) }); // startSession enforces liveness/history guards
     return;
   }
 
@@ -1249,7 +1255,7 @@ bot.on('callback_query:data', async ctx => {
     if (!e?.cwd) { await ctx.answerCallbackQuery({ text: 'unknown session' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(e.cwd, { resumeUuid: id, chatId: ctx.chat.id });
+    startSession(e.cwd, { resumeUuid: id, chatId: here(ctx) });
     return;
   }
 
@@ -1257,7 +1263,7 @@ bot.on('callback_query:data', async ctx => {
     const p = lastProjects[Number(m[1])];
     if (!p?.cwd) { await ctx.answerCallbackQuery({ text: 'open /projects again' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'starting…' }).catch(() => {});
-    startSession(p.cwd, { chatId: ctx.chat.id });
+    startSession(p.cwd, { chatId: here(ctx) });
     return;
   }
 
@@ -1278,14 +1284,14 @@ bot.on('callback_query:data', async ctx => {
     const hint = PROJECT_ROOTS.length ? `папка в ${PROJECT_ROOTS.join(' или ')}` : 'полный путь к существующей папке';
     const sent = await ctx.reply(`Название нового проекта (${hint}) — ответом на это сообщение:`,
       { reply_markup: { force_reply: true, input_field_placeholder: PROJECT_ROOTS.length ? 'Oligo' : 'D:/path/to/project' } }).catch(() => null);
-    if (sent?.message_id) newProjPrompt.set(sent.message_id, ctx.chat.id);
+    if (sent?.message_id) newProjPrompt.set(sent.message_id, here(ctx));
     return;
   }
 
   if ((m = /^npr:(\d+)$/.exec(data))) {
-    const root = PROJECT_ROOTS[Number(m[1])], arg = newProjArg.get(ctx.chat.id);
+    const root = PROJECT_ROOTS[Number(m[1])], arg = newProjArg.get(here(ctx));
     if (!root || !arg) { await ctx.answerCallbackQuery({ text: 'устарело — /new ещё раз' }).catch(() => {}); return; }
-    newProjArg.delete(ctx.chat.id);
+    newProjArg.delete(here(ctx));
     await ctx.answerCallbackQuery().catch(() => {});
     await ctx.editMessageReplyMarkup().catch(() => {});
     await newProject(ctx, arg, root);
@@ -1310,7 +1316,7 @@ bot.on('message:text', async ctx => {
 
   // the answer to a ➕ Новый проект prompt is the project's name
   const rid = ctx.message.reply_to_message?.message_id;
-  if (rid && newProjPrompt.get(rid) === ctx.chat.id) { newProjPrompt.delete(rid); await newProject(ctx, text); return; }
+  if (rid && newProjPrompt.get(rid) === here(ctx)) { newProjPrompt.delete(rid); await newProject(ctx, text); return; }
 
   // reply to a bot message -> its session, WITH the quoted text (the reply may target
   // an old message, so the session needs to see which one).
@@ -1322,7 +1328,7 @@ bot.on('message:text', async ctx => {
   // text, so a format change on one side without the other silently turns taps into prompts.
   const bare = stripActiveMark(text);
   const swId = order.find(x => labelOf(x) === bare);   // bottom keyboard renders the bare label — match on it
-  if (swId) { active.set(ctx.chat.id, swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
+  if (swId) { active.set(here(ctx), swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(here(ctx)) }); return; }
 
   // /to <label> <text> -> one-off send to a specific session without switching
   // Labels may contain spaces, so take the LONGEST label the rest starts with ("Oligo 2" over "Oligo").
@@ -1340,8 +1346,8 @@ bot.on('message:text', async ctx => {
   if (!cur) {
     // Don't drop what they wrote: hold it and let them pick a session — the tap delivers it.
     if (!order.length) { await ctx.reply('нет живых сессий — /projects, чтобы поднять'); return; }
-    await ctx.reply('в этом чате нет активной сессии — выбери, куда отправить:', { reply_markup: sessionInline(ctx.chat.id) });
-    pending.put(ctx.chat.id, quoted + text);
+    await ctx.reply('в этом чате нет активной сессии — выбери, куда отправить:', { reply_markup: sessionInline(here(ctx)) });
+    pending.put(here(ctx), quoted + text);
     return;
   }
   // reply to a non-bot message (yours, someone else's, or a bot msg forgotten after a

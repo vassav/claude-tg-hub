@@ -2,7 +2,7 @@
 // Unit test for chat-target.mjs — pure functions, no I/O.
 // Run from repo root:  node tg-hub/chat-target-test.mjs
 import assert from 'node:assert/strict';
-import { isGroup, replyExtra, askChatFor, nextInbound } from './chat-target.mjs';
+import { isGroup, replyExtra, askChatFor, nextInbound, placeOf, splitPlace } from './chat-target.mjs';
 
 let n = 0; const ok = m => { n++; console.log('  ✓', m); };
 
@@ -66,5 +66,18 @@ assert.deepEqual(
   'возвращённая запись всегда несёт chat_id/message_id/user/user_id из meta',
 );
 ok('nextInbound: спорность при конкурирующих авторах, пока не отвечено');
+
+const forum = { id: -100500, type: 'supergroup', is_forum: true };
+assert.equal(placeOf(forum, { is_topic_message: true, message_thread_id: 45 }), '-100500:45', 'тема форума');
+assert.equal(placeOf(forum, { message_thread_id: 45 }), '-100500', 'ветка ответов в обычной группе — не тема');
+assert.equal(placeOf(forum, {}), '-100500', 'General-тема форума — без треда');
+assert.equal(placeOf({ id: 300447655 }, undefined), '300447655', 'личка, нажатие без сообщения');
+assert.deepEqual(splitPlace('-100500:45'), { chat: '-100500', thread: { message_thread_id: 45 } });
+assert.deepEqual(splitPlace('-100500'), { chat: '-100500', thread: {} });
+assert.deepEqual(splitPlace(300447655), { chat: '300447655', thread: {} });
+assert.equal(isGroup('-100500:45'), true, 'место в теме — тоже группа');
+assert.deepEqual(replyExtra({ chat_id: '-100500:45', message_id: '7' }, '-100500:45'), { reply_parameters: { message_id: 7, allow_sending_without_reply: true } }, 'цитата в той же теме');
+assert.deepEqual(replyExtra({ chat_id: '-100500:45', message_id: '7' }, '-100500:46'), {}, 'другая тема — не цитируем');
+ok('placeOf/splitPlace: тема ↔ "chat:thread", General и обычные группы — без треда');
 
 console.log(`\n✅ chat-target-test: ${n} групп проверок пройдено`);

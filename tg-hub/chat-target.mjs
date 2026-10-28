@@ -6,6 +6,19 @@
 
 export const isGroup = chatId => String(chatId ?? '').startsWith('-');
 
+// A "place" is where a conversation lives: a chat, or a topic of a forum group —
+// "<chat_id>" or "<chat_id>:<thread_id>". It is what the hub keys a chat's active session
+// by, and what sessions get as chat_id and hand back unchanged in reply/send_file/commands,
+// so the topic survives the round trip. Only the calls into Telegram split it (splitPlace).
+// is_topic_message, not just message_thread_id: an ordinary group sets the latter on any
+// reply thread, and the General topic of a forum has no thread to address at all.
+export const placeOf = (chat, msg) =>
+  msg?.is_topic_message && msg.message_thread_id ? `${chat.id}:${msg.message_thread_id}` : String(chat?.id ?? '');
+export function splitPlace(place) {
+  const m = /^(-?\d+):(\d+)$/.exec(String(place ?? ''));
+  return m ? { chat: m[1], thread: { message_thread_id: Number(m[2]) } } : { chat: String(place ?? ''), thread: {} };
+}
+
 // Quote the message that asked, so two people talking in one GROUP can tell whose answer
 // is whose. Deliberately not done in a private chat: there is only one asker, the quote
 // carries no information, and it stacks a second quote block on top of the session header.
