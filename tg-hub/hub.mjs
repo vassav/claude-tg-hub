@@ -134,6 +134,8 @@ const activeIn = ctx => active.get(ctx.chat?.id);
 const pendingActivate = new Map(); // sessionId -> chatId that asked for it (new/resume flow)
 const pendingFirstMsg = new Map(); // id -> { content, meta } to inject once the session registers (external {t:'start',content})
 const awaitingTitle = new Set();   // ids whose meaningful name we're awaiting (model set_title, else slug fallback)
+const newProjPrompt = new Map();   // message_id of a "name the new project" prompt -> chat id; a reply to it is the name
+const newProjArg = new Map();      // chat id -> project name waiting for its root to be picked (several HUB_PROJECTS)
 
 // history browse state (snapshot for callback buttons)
 let lastProjects = [];         // [{ dir, cwd, sessions:[{id,mtime,title?}], latest }]
@@ -681,7 +683,31 @@ function projectsKeyboard() {
     p.cwd = cwd;
     kb.text(`${shortCwd(cwd)} (${p.sessions.length}) · ${ago(p.latest)}`, `proj:${i}`).row();
   });
+  kb.text('➕ Новый проект', 'newproj').row();
   return kb;
+}
+const projectsPrompt = () => lastProjects.length ? PROJECTS_PROMPT : '📁 Проектов с сессиями пока нет — создай новый:';
+
+// /new <arg> and ➕ Новый проект: resolve the name/path (access.projectPath), create the
+// folder if it's missing and allowed, then start a session there, active in this chat.
+// `root` is set when the user picked one of several HUB_PROJECTS roots.
+async function newProject(ctx, arg, root) {
+  const r = access.projectPath(arg, root ? [root] : PROJECT_ROOTS);
+  if (r.error) { await ctx.reply(`⚠️ ${r.error}`); return; }
+  if (r.pickRoot) {
+    newProjArg.set(ctx.chat.id, arg);
+    const kb = new InlineKeyboard();
+    PROJECT_ROOTS.forEach((p, i) => kb.text(p, `npr:${i}`).row());
+    await ctx.reply(`Где создать «${arg.trim()}»?`, { reply_markup: kb });
+    return;
+  }
+  if (!existsSync(r.cwd)) {
+    if (!r.canCreate) { await ctx.reply(`⚠️ папки нет: ${r.cwd}`); return; }
+    try { mkdirSync(r.cwd, { recursive: true }); }
+    catch (e) { await ctx.reply(`⚠️ не смог создать ${r.cwd}: ${e?.message || e}`); return; }
+    await ctx.reply(`📁 создан проект ${r.cwd}`);
+  }
+  if (startSession(r.cwd, { chatId: ctx.chat.id })) await ctx.reply(`➕ starting new session in ${r.cwd}…`);
 }
 
 // ── startup recovery ─────────────────────────────────────────────────────────
@@ -974,8 +1000,7 @@ bot.command('sessions', async ctx => {
 bot.command('projects', async ctx => {
   if (!owns(ctx)) return;
   const kb = projectsKeyboard();
-  if (!lastProjects.length) { await ctx.reply('no past sessions found'); return; }
-  await ctx.reply(PROJECTS_PROMPT, { reply_markup: kb });
+  await ctx.reply(projectsPrompt(), { reply_markup: kb });
 });
 
 bot.command('use', async ctx => {
@@ -997,9 +1022,9 @@ bot.command('stop', async ctx => {
 
 bot.command('new', async ctx => {
   if (!owns(ctx)) return;
-  const cwd = (ctx.match || '').trim();
-  if (!cwd) { await ctx.reply('usage: /new <project path>\n(or /projects → ➕ New session here)'); return; }
-  if (startSession(cwd, { chatId: ctx.chat.id })) await ctx.reply(`➕ starting new session in ${cwd}…`);
+  const arg = (ctx.match || '').trim();
+  if (!arg) { await ctx.reply(`usage: /new <имя проекта | полный путь>\n${PROJECT_ROOTS.length ? `имя — папка в ${PROJECT_ROOTS.join(' или ')}, создаётся, если её нет` : 'у этого бота нет HUB_PROJECTS — только полный путь к существующей папке'}\n(или /projects → ➕)`); return; }
+  await newProject(ctx, arg);
 });
 
 // Panel/stream commands → forwarded to the active control-capable session, which
@@ -1166,7 +1191,7 @@ bot.on('callback_query:data', async ctx => {
   if (data === 'back:projects') {
     await ctx.answerCallbackQuery().catch(() => {});
     const kb = projectsKeyboard();
-    await ctx.editMessageText(lastProjects.length ? PROJECTS_PROMPT : 'no past sessions found', { reply_markup: lastProjects.length ? kb : undefined }).catch(() => {});
+    await ctx.editMessageText(projectsPrompt(), { reply_markup: kb }).catch(() => {});
     return;
   }
 
@@ -1200,6 +1225,26 @@ bot.on('callback_query:data', async ctx => {
     return;
   }
 
+  // ➕ Новый проект → ask for the name; the reply to this prompt goes to newProject().
+  if (data === 'newproj') {
+    await ctx.answerCallbackQuery().catch(() => {});
+    const hint = PROJECT_ROOTS.length ? `папка в ${PROJECT_ROOTS.join(' или ')}` : 'полный путь к существующей папке';
+    const sent = await ctx.reply(`Название нового проекта (${hint}) — ответом на это сообщение:`,
+      { reply_markup: { force_reply: true, input_field_placeholder: PROJECT_ROOTS.length ? 'Oligo' : 'D:/path/to/project' } }).catch(() => null);
+    if (sent?.message_id) newProjPrompt.set(sent.message_id, ctx.chat.id);
+    return;
+  }
+
+  if ((m = /^npr:(\d+)$/.exec(data))) {
+    const root = PROJECT_ROOTS[Number(m[1])], arg = newProjArg.get(ctx.chat.id);
+    if (!root || !arg) { await ctx.answerCallbackQuery({ text: 'устарело — /new ещё раз' }).catch(() => {}); return; }
+    newProjArg.delete(ctx.chat.id);
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup().catch(() => {});
+    await newProject(ctx, arg, root);
+    return;
+  }
+
   await ctx.answerCallbackQuery().catch(() => {});
 });
 
@@ -1216,10 +1261,13 @@ bot.on('message:text', async ctx => {
     return;
   }
 
+  // the answer to a ➕ Новый проект prompt is the project's name
+  const rid = ctx.message.reply_to_message?.message_id;
+  if (rid && newProjPrompt.get(rid) === ctx.chat.id) { newProjPrompt.delete(rid); await newProject(ctx, text); return; }
+
   // reply to a bot message -> its session, WITH the quoted text (the reply may target
   // an old message, so the session needs to see which one).
   const quoted = quotePrefix(ctx);
-  const rid = ctx.message.reply_to_message?.message_id;
   if (rid && outMsgToSession.has(rid)) { await routeTo(ctx, outMsgToSession.get(rid), quoted + text); return; }
 
   // bare button tap from the keyboard -> switch this chat's active session.

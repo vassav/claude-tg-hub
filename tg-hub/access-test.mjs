@@ -106,4 +106,24 @@ if (process.platform === 'win32') {
 }
 ok('inRoots: корень, вложенность, регистр, префикс, .., диск');
 
+// 9. projectPath
+if (process.platform === 'win32') {
+  const one = ['D:\\Work'], two = ['D:\\Work', 'E:\\Lab'];
+  assert.deepEqual(access.projectPath('Oligo', one), { cwd: 'D:\\Work\\Oligo', canCreate: true }, 'имя → в корень');
+  assert.deepEqual(access.projectPath(' "Clients/Oligo" ', one), { cwd: 'D:\\Work\\Clients\\Oligo', canCreate: true }, 'подпапка, кавычки, пробелы');
+  assert.deepEqual(access.projectPath('D:/Work/X', one), { cwd: 'D:\\Work\\X', canCreate: true }, 'полный путь внутри корня');
+  assert.ok(access.projectPath('C:/Other', one).error, 'полный путь вне корня');
+  assert.deepEqual(access.projectPath('C:/Other', []), { cwd: 'C:\\Other', canCreate: false }, 'без корней: полный путь — как есть, без создания');
+  assert.ok(access.projectPath('Oligo', []).error, 'без корней: имя — ошибка');
+  assert.ok(access.projectPath('../Other', one).error, 'выход через ..');
+  assert.ok(access.projectPath('a/../../Other', one).error, 'выход через вложенное ..');
+  assert.deepEqual(access.projectPath('a/../b', one), { cwd: 'D:\\Work\\b', canCreate: true }, '.. внутри корня — можно');
+  for (const bad of ['a:b', 'a?', 'x/<y>', 'CON', 'nul.txt', 'dot.', 'space /x'])
+    assert.ok(access.projectPath(bad, one).error, `недопустимое имя: ${bad}`);
+  assert.deepEqual(access.projectPath('Oligo', two), { pickRoot: true }, 'несколько корней → выбрать');
+  assert.ok(access.projectPath('../Other', two).error, 'несколько корней: выход через .. — отказ сразу, без выбора');
+  assert.ok(access.projectPath('', one).error, 'пусто');
+}
+ok('projectPath: имя, подпапка, полный путь, без корней, .., запрещённые имена, выбор корня');
+
 console.log(`\n✅ access-test: ${n} групп проверок пройдено`);

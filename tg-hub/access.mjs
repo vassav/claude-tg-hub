@@ -82,3 +82,27 @@ export function inRoots(cwd, roots) {
     return r === '' || (!isAbsolute(r) && r.split(/[\\/]/)[0] !== '..');
   });
 }
+
+// What `/new <arg>` and ➕ New project point at. A full path is taken as is (inside the
+// roots, if there are any); a bare name or relative path lands in the root. A missing
+// folder may be created only inside a root, so a typo in a full path can't litter the
+// disk. Returns { cwd, canCreate } | { pickRoot } (a name, several roots) | { error }.
+const BAD_CHARS = /[<>:"|?*\x00-\x1f]/;                     // not allowed in a Windows file name
+const RESERVED = /^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i;  // device names Windows won't create
+export function projectPath(arg, roots) {
+  const a = String(arg || '').trim().replace(/^["']+|["']+$/g, '');
+  if (!a) return { error: 'укажи имя проекта или полный путь' };
+  if (isAbsolute(a)) {
+    const cwd = resolve(a);
+    if (roots?.length && !inRoots(cwd, roots)) return { error: `${cwd} — вне папок этого бота` };
+    return { cwd, canCreate: !!roots?.length };
+  }
+  if (!roots?.length) return { error: 'у этого бота не задан HUB_PROJECTS — укажи полный путь' };
+  const bad = a.split(/[\\/]/).find(s => s && s !== '.' && s !== '..' && (BAD_CHARS.test(s) || RESERVED.test(s) || /[. ]$/.test(s)));
+  if (bad !== undefined) return { error: `недопустимое имя папки: «${bad}»` };
+  // `..` escapes every root alike, so one test serves before the root is even picked
+  const cwd = resolve(roots[0], a);
+  if (!inRoots(cwd, [roots[0]])) return { error: `${a} выходит за пределы папки проектов` };
+  if (roots.length > 1) return { pickRoot: true };
+  return { cwd, canCreate: true };
+}
