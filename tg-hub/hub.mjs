@@ -217,7 +217,9 @@ const btnOf = id => buttonLabel(labelOf(id));   // inline caption: name only —
 
 // Labels keep unicode letters/digits (so a Russian request doesn't collapse to
 // 'session'); everything else becomes '-'. Trimmed, capped at 40 chars.
-function sanitizeLabel(s) { return (s || '').normalize('NFC').replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^[-.]+/, '').slice(0, 40).replace(/[-.]+$/, ''); }
+// Words stay words: "Проверка заголовка сессии", not "Проверка-заголовка-сессии". Only /to
+// splits a label from text, and it matches whole labels (see there), so spaces are safe.
+function sanitizeLabel(s) { return (s || '').normalize('NFC').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim().replace(/^[-.]+/, '').slice(0, 40).replace(/[\s.-]+$/, ''); }
 function folderBase(cwd) { return sanitizeLabel((cwd || '').replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || '') || 'session'; }
 // A short slug from free text (first ~7 words) — the auto-name fallback.
 function slugLabel(text) { return sanitizeLabel(String(text || '').trim().split(/\s+/).slice(0, 7).join(' ')); }
@@ -232,7 +234,7 @@ function uniqueLabel(base, exceptId) {
   base = base || 'session';
   const used = visibleLabels(exceptId);
   let label = base, i = 2;
-  while (used.has(label)) label = `${base}-${i++}`;
+  while (used.has(label)) label = `${base} ${i++}`;
   return label;
 }
 // Provisional name at creation: deduped project-folder basename.
@@ -611,9 +613,27 @@ function readMeta(file) {
   try {
     // Only the head: transcripts run to tens of MB, and HUB_PROJECTS reads one per project
     // on every /projects. 160 KB always holds the first 40000 chars, even at 4 bytes each.
+    // The engine's own name for the session is appended as the conversation goes on — an
+    // `ai-title` it generated (panel, or our bridge with persist:true) or a `custom-title`
+    // someone set — so look in the tail as well. The last one wins; a set name beats a
+    // generated one.
     const buf = Buffer.alloc(160000), fd = openSync(file, 'r');
-    let n; try { n = readSync(fd, buf, 0, buf.length, 0); } finally { closeSync(fd); }
+    let n, tail = '';
+    try {
+      n = readSync(fd, buf, 0, buf.length, 0);
+      const size = statSync(file).size;
+      if (size > n) { const tb = Buffer.alloc(Math.min(256000, size - n)); tail = tb.toString('utf8', 0, readSync(fd, tb, 0, tb.length, size - tb.length)); }
+    } finally { closeSync(fd); }
     const head = buf.toString('utf8', 0, n).slice(0, 40000);
+    let ai = '', custom = '';
+    for (const chunk of [buf.toString('utf8', 0, n), tail])
+      for (const line of chunk.split('\n')) {
+        if (!line.includes('-title"')) continue;
+        let o; try { o = JSON.parse(line); } catch { continue; }
+        if (o.type === 'ai-title' && o.aiTitle) ai = String(o.aiTitle);
+        if (o.type === 'custom-title' && o.customTitle) custom = String(o.customTitle);
+      }
+    title = (custom || ai).replace(/\s+/g, ' ').trim().slice(0, 50);
     for (const line of head.split('\n')) {
       if (!line.trim()) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
@@ -1278,8 +1298,16 @@ bot.on('message:text', async ctx => {
   if (swId) { active.set(ctx.chat.id, swId); await ctx.reply(`▶ active: ${labelOf(swId)}`, { reply_markup: replyKeyboard(ctx.chat.id) }); return; }
 
   // /to <label> <text> -> one-off send to a specific session without switching
-  const mm = /^\/to\s+(\S+)\s+([\s\S]+)$/.exec(text);
-  if (mm) { const id = order.find(x => labelOf(x) === mm[1]); if (id) { await routeTo(ctx, id, mm[2]); } else { await ctx.reply(`no session "${mm[1]}" — see /sessions`); } return; }
+  // Labels may contain spaces, so take the LONGEST label the rest starts with ("Oligo 2" over "Oligo").
+  const mm = /^\/to\s+([\s\S]+)$/.exec(text);
+  if (mm) {
+    const rest = mm[1];
+    const id = order.filter(x => rest.startsWith(labelOf(x) + ' ') || rest.startsWith(labelOf(x) + '\n'))
+      .sort((a, b) => labelOf(b).length - labelOf(a).length)[0];
+    if (id) await routeTo(ctx, id, rest.slice(labelOf(id).length).trim());
+    else await ctx.reply(`no session "${rest.split(/\s/)[0]}" — see /sessions`);
+    return;
+  }
 
   const cur = activeIn(ctx);
   if (!cur) {

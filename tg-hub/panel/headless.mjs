@@ -161,8 +161,10 @@ function onEngine(o) {
     const to = boundChatId || OWNER;
     if (to) for (const b of o.message.content) if (b.type === 'text' && b.text?.trim()) sendHub({ t: 'reply', sessionId: SESSION_ID, chat_id: to, text: b.text });
     // Name the session the way VS Code names a panel one: ask the ENGINE to generate a
-    // title (subtype seen in extension.js 2.1.220 — generateSessionTitle -> persist:false),
-    // and let the existing control_response listener below relay it to the hub. Nobody
+    // title (subtype seen in extension.js 2.1.220 — generateSessionTitle), and let the
+    // existing control_response listener below relay it to the hub. persist:true, as the
+    // extension does: the engine also writes {type:'ai-title'} into the transcript, so the
+    // name survives /stop and a hub restart (/projects reads it from there). Nobody
     // issues this request for a hub-launched session, which is why every one of them fell
     // back to a slug of its first request. Once per session, after the model has said
     // something worth summarising. `description` is what the title is made from — the
@@ -172,7 +174,7 @@ function onEngine(o) {
     if (!titleAsked && firstAsk && !rest.includes('--resume')) {
       titleAsked = true;
       toEngine({ type: 'control_request', request_id: 'tg_' + randomUUID().slice(0, 12),
-        request: { subtype: 'generate_session_title', description: firstAsk.slice(0, 2000), persist: false } });
+        request: { subtype: 'generate_session_title', description: firstAsk.slice(0, 2000), persist: true } });
     }
     const out = Number(o.message?.usage?.output_tokens || 0);
     if (out) {
