@@ -86,6 +86,15 @@ assert.equal(access.parseTarget('не число', null), null);
 assert.equal(access.parseTarget('', null), null);
 ok('parseTarget: реплай, "<id> имя", "<id>", мусор');
 
+// 7b. personOf: a shared contact points at the person in it, not at whoever sent it
+const fromOwner = { id: 1, first_name: 'Owner' };
+assert.deepEqual(access.personOf({ from: fromOwner, contact: { user_id: 55, first_name: 'Александр', last_name: 'Козаренко' } }), { id: 55, first_name: 'Александр Козаренко' });
+assert.deepEqual(access.parseTarget('', access.personOf({ from: fromOwner, contact: { user_id: 55, first_name: 'Александр', last_name: 'Козаренко' } })), { id: '55', name: 'Александр Козаренко' });
+assert.equal(access.personOf({ from: fromOwner, contact: { phone_number: '+7', first_name: 'Без аккаунта' } }), fromOwner, 'контакт без user_id — автор');
+assert.equal(access.personOf({ from: fromOwner }), fromOwner, 'обычное сообщение — автор');
+assert.equal(access.personOf(undefined), undefined);
+ok('personOf: контакт → человек из контакта, иначе автор');
+
 // 8. inRoots
 assert.equal(access.inRoots('D:\\Anything', []), true, 'без корней — всё');
 assert.equal(access.inRoots('', ['D:\\Work']), false, 'пустой cwd при корнях — нет');

@@ -987,7 +987,7 @@ const ALLOW_USAGE = 'usage: /allow <user_id> [имя]\nили ответь эт�
 
 bot.command('allow', async ctx => {
   if (!isOwner(ctx)) { if (owns(ctx)) await ctx.reply('только владелец может менять список'); return; }
-  const t = access.parseTarget(ctx.match, ctx.message?.reply_to_message?.from);
+  const t = access.parseTarget(ctx.match, access.personOf(ctx.message?.reply_to_message));
   if (!t) { await ctx.reply(ALLOW_USAGE); return; }
   if (t.id === OWNER) { await ctx.reply('это ты — владелец, тебе список не нужен'); return; }
   await ctx.reply(access.add(t.id, t.name, ctx.from.id)
@@ -997,9 +997,25 @@ bot.command('allow', async ctx => {
 
 bot.command('deny', async ctx => {
   if (!isOwner(ctx)) { if (owns(ctx)) await ctx.reply('только владелец может менять список'); return; }
-  const t = access.parseTarget(ctx.match, ctx.message?.reply_to_message?.from);
+  const t = access.parseTarget(ctx.match, access.personOf(ctx.message?.reply_to_message));
   if (!t) { await ctx.reply(ALLOW_USAGE.replace(/allow/g, 'deny')); return; }
   await ctx.reply(access.remove(t.id) ? `🚫 ${t.name} (${t.id}) удалён из списка` : `${t.name} (${t.id}) в списке и не был`);
+});
+
+// A shared contact carries the person's user_id when it's a Telegram account — the way to
+// add someone the bot hasn't seen write yet: the Bot API can't turn @username into an id,
+// and an @mention in text arrives without one.
+const contactNames = new Map();   // user_id -> name, for the ✅ button below
+bot.on('message:contact', async ctx => {
+  if (!isOwner(ctx)) return;
+  const c = ctx.message.contact;
+  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || String(c.user_id || '?');
+  if (!c.user_id) { await ctx.reply(`👤 ${name}: это не аккаунт Telegram (или он скрыт) — id в контакте нет`); return; }
+  const id = String(c.user_id);
+  if (id === OWNER) { await ctx.reply('это ты — владелец, тебе список не нужен'); return; }
+  if (access.roleOf(id)) { await ctx.reply(`👤 ${name} (${id}) уже в списке доступа — /deny ответом на контакт, чтобы убрать`); return; }
+  contactNames.set(id, name);
+  await ctx.reply(`👤 ${name} — id ${id}`, { reply_markup: new InlineKeyboard().text('✅ Разрешить в группах', `allowc:${id}`) });
 });
 
 bot.command('who', async ctx => {
@@ -1242,6 +1258,17 @@ bot.on('callback_query:data', async ctx => {
     if (!p?.cwd) { await ctx.answerCallbackQuery({ text: 'open /projects again' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'starting…' }).catch(() => {});
     startSession(p.cwd, { chatId: ctx.chat.id });
+    return;
+  }
+
+  // ✅ under a shared contact → add that person to the access list (owner only, like /allow)
+  if ((m = /^allowc:(\d+)$/.exec(data))) {
+    if (!isOwner(ctx)) { await ctx.answerCallbackQuery({ text: 'только владелец может менять список' }).catch(() => {}); return; }
+    const id = m[1], name = contactNames.get(id) || id;
+    const added = access.add(id, name, ctx.from.id);
+    contactNames.delete(id);
+    await ctx.answerCallbackQuery({ text: added ? 'добавлен' : 'уже в списке' }).catch(() => {});
+    await ctx.editMessageText(added ? `✅ ${name} (${id}) добавлен — может писать боту в групповых чатах` : `${name} (${id}) уже в списке`).catch(() => {});
     return;
   }
 

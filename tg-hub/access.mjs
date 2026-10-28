@@ -61,6 +61,15 @@ export function canUse({ userId, chatType, isBot }, { owner }) {
   return (chatType === 'group' || chatType === 'supergroup') && !!roleOf(userId);
 }
 
+// Whom a replied-to message points at: the person in a shared contact, if it's a Telegram
+// account (contact.user_id) — the owner sending a contact is not the one to add — else
+// the message's author. Shaped like a Telegram User, for parseTarget.
+export function personOf(msg) {
+  const c = msg?.contact;
+  if (c?.user_id) return { id: c.user_id, first_name: [c.first_name, c.last_name].filter(Boolean).join(' ') || String(c.user_id) };
+  return msg?.from;
+}
+
 // `/allow` target: the quoted message's author if the command was a reply, else the
 // "<id> [name]" typed inline. Bot API can't resolve @username -> id, so a bare nick
 // is deliberately NOT accepted.
