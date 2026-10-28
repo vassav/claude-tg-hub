@@ -109,7 +109,7 @@ function handle(msg) {
       protocolVersion: params?.protocolVersion || '2025-06-18',
       capabilities: { experimental: { 'claude/channel': {}, 'claude/channel/permission': {} }, tools: {} },
       serverInfo: { name: 'tg-hub-shim', version: '0.0.3' },
-      instructions: [
+      instructions: (JOIN ? [
         'Some user messages arrive wrapped in <channel source="hub" chat_id="..." message_id="..." user="..." ts="...">…</channel>.',
         'These come from a REMOTE user on Telegram who is NOT at this computer and does NOT see this window, panel, or terminal.',
         'The ONLY way to answer a <channel> message is to call the `reply` tool with the chat_id from its tag —',
@@ -124,17 +124,23 @@ function handle(msg) {
         'Right after handling the FIRST message of a new conversation — whether it arrived as a <channel>',
         'message or as an ordinary user turn — also call `set_title` ONCE with',
         "a short (≤40 chars) title summarizing it, in the user's language. Do not announce set_title.",
+      ] : []).concat([
         // Text-only channel: the user sees ONLY what the tools send. To deliver a picture or
         // file (a screenshot, a generated image/PDF, a log), use `send_file` with its local
         // path — pasting the path as text in `reply` sends them nothing they can open.
         'To send the user a picture or file (screenshot, generated image, PDF, log), call',
         '`send_file` with the local path — do NOT just mention the path in `reply`, it is not reachable to them.',
-      ].join(' '),
+      ]).join(' '),
     }});
     return;
   }
   if (method === 'notifications/initialized') return;
   if (method === 'tools/list') {
+    // reply/set_title only mean something to a session the hub knows. Not joined — a plain
+    // session with the plugin, or one a stream bridge (hub headless, VSCode panel) already
+    // mirrors and names — they could only fail with "hub not joined", and in a bridged
+    // session even after an approval card for the useless call.
+    const joinedOnly = new Set(['reply', 'set_title']);
     toEngine({ jsonrpc: '2.0', id, result: { tools: [{
       name: 'reply',
       description: 'Send a message to the user over Telegram. Pass chat_id from the inbound <channel> tag and the text to send.',
@@ -156,7 +162,7 @@ function handle(msg) {
         chat_id: { type: 'string', description: 'Optional target chat; defaults to the hub home chat. Pass the chat_id from an inbound <channel> tag to answer that user.' },
         as: { type: 'string', enum: ['auto', 'photo', 'document'], description: 'auto (default) = photo for images, document otherwise. Force `document` to send an image without recompression.' },
       }, required: ['path'] },
-    }] }});
+    }].filter(t => JOIN || !joinedOnly.has(t.name)) }});
     return;
   }
   if (method === 'tools/call') {

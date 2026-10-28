@@ -38,6 +38,7 @@ let cwd = process.cwd(), boundChatId = '';
 // turn with tools is many calls, so we sum. A `user` message means a new turn → reset.
 let turnTokens = 0, lastStatusAt = 0;
 let titleAsked = false;   // ask the engine for a session title exactly once (see generate_session_title below)
+let firstAsk = '';        // the first request we injected — what the title is generated FROM
 
 // ── hub TCP client (mirror of shim/interposer) ───────────────────────────────
 let hub = null, hubBuf = '', hubReady = false, queue = [], registered = false;
@@ -83,6 +84,7 @@ function onHub(m) {
 function toEngine(obj) { try { child.stdin.write(JSON.stringify(obj) + '\n'); } catch (e) { log('engine write err', String(e)); } }
 function injectUser(text) {
   if (!text) return;
+  if (!firstAsk) firstAsk = text;
   toEngine({ type: 'user', uuid: randomUUID(), session_id: '', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text }] } });
   log('INJECT user', text.slice(0, 120));
 }
@@ -149,6 +151,7 @@ function onEngine(o) {
     if (cmds.onControlResponse(o)) return;
     // engine-generated session title -> name the hub session
     if (o.response?.response?.title) { sendHub({ t: 'title', sessionId: SESSION_ID, title: String(o.response.response.title).slice(0, 60) }); return; }
+    if (String(o.response?.request_id || '').startsWith('tg_')) log('title failed', o.response);   // else it fails silently into the slug
     return;
   }
   // tool approval request -> Telegram buttons
@@ -162,11 +165,14 @@ function onEngine(o) {
     // and let the existing control_response listener below relay it to the hub. Nobody
     // issues this request for a hub-launched session, which is why every one of them fell
     // back to a slug of its first request. Once per session, after the model has said
-    // something worth summarising.
-    if (!titleAsked) {
+    // something worth summarising. `description` is what the title is made from — the
+    // extension passes it too (generateSessionTitle(description, …)); without it the engine
+    // has nothing to name, and the session kept the slug. A resumed session already has its
+    // name, and the first request after a resume ("продолжай") says nothing about it.
+    if (!titleAsked && firstAsk && !rest.includes('--resume')) {
       titleAsked = true;
       toEngine({ type: 'control_request', request_id: 'tg_' + randomUUID().slice(0, 12),
-        request: { subtype: 'generate_session_title', persist: false } });
+        request: { subtype: 'generate_session_title', description: firstAsk.slice(0, 2000), persist: false } });
     }
     const out = Number(o.message?.usage?.output_tokens || 0);
     if (out) {

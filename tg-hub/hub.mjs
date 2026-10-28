@@ -500,7 +500,8 @@ function sessionsText(chatId) {
 }
 async function routeTo(ctx, id, body) {
   const meta = {
-    chat_id: String(ctx.chat.id), message_id: String(ctx.message.message_id),
+    // no message when a held text is delivered by a button tap — then there's nothing to quote
+    chat_id: String(ctx.chat.id), message_id: ctx.message ? String(ctx.message.message_id) : '',
     user: ctx.from.username || String(ctx.from.id), user_id: String(ctx.from.id), ts: new Date().toISOString(),
   };
   if (!sendToSession(id, { t: 'inbound', content: body, meta })) { await ctx.reply('⚠️ session not connected'); return false; }
