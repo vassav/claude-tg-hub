@@ -17,6 +17,7 @@ export function createActive() {
     // A dead session must stop being "active" everywhere at once — and must NOT be
     // replaced by a guess, or the next message would land in a random session.
     clearSession(sessionId) { for (const [c, s] of m) if (s === sessionId) m.delete(c); },
+    drop(chatId) { m.delete(key(chatId)); },   // a place that is gone (a deleted forum topic)
     chatsFor(sessionId) { return [...m].filter(([, s]) => s === sessionId).map(([c]) => c); },
   };
 }

@@ -2,7 +2,7 @@
 // Unit test for chat-target.mjs — pure functions, no I/O.
 // Run from repo root:  node tg-hub/chat-target-test.mjs
 import assert from 'node:assert/strict';
-import { isGroup, replyExtra, askChatFor, nextInbound, placeOf, splitPlace } from './chat-target.mjs';
+import { isGroup, replyExtra, askChatFor, nextInbound, placeOf, splitPlace, isTopicPlace, topicLink, isTopicGoneError } from './chat-target.mjs';
 
 let n = 0; const ok = m => { n++; console.log('  ✓', m); };
 
@@ -79,5 +79,16 @@ assert.equal(isGroup('-100500:45'), true, 'место в теме — тоже �
 assert.deepEqual(replyExtra({ chat_id: '-100500:45', message_id: '7' }, '-100500:45'), { reply_parameters: { message_id: 7, allow_sending_without_reply: true } }, 'цитата в той же теме');
 assert.deepEqual(replyExtra({ chat_id: '-100500:45', message_id: '7' }, '-100500:46'), {}, 'другая тема — не цитируем');
 ok('placeOf/splitPlace: тема ↔ "chat:thread", General и обычные группы — без треда');
+
+assert.equal(isTopicPlace('-1004366292978:17'), true);
+assert.equal(isTopicPlace('-1004366292978'), false);
+assert.equal(isTopicPlace('300447655'), false);
+assert.equal(topicLink('-1004366292978:17'), 'https://t.me/c/4366292978/17');
+assert.equal(topicLink('-1004366292978'), '', 'без темы — ссылки нет');
+assert.equal(isTopicGoneError('Bad Request: message thread not found'), true);
+assert.equal(isTopicGoneError('Bad Request: TOPIC_ID_INVALID'), true);
+assert.equal(isTopicGoneError('Bad Request: TOPIC_CLOSED'), false, 'закрытая тема — не пропавшая');
+assert.equal(isTopicGoneError(undefined), false);
+ok('isTopicPlace/topicLink/isTopicGoneError');
 
 console.log(`\n✅ chat-target-test: ${n} групп проверок пройдено`);

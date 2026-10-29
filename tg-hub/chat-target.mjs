@@ -18,6 +18,15 @@ export function splitPlace(place) {
   const m = /^(-?\d+):(\d+)$/.exec(String(place ?? ''));
   return m ? { chat: m[1], thread: { message_thread_id: Number(m[2]) } } : { chat: String(place ?? ''), thread: {} };
 }
+export const isTopicPlace = place => /^-?\d+:\d+$/.test(String(place ?? ''));
+// t.me link that opens a topic: supergroup ids are -100<id>, links use the bare <id>.
+export function topicLink(place) {
+  const m = /^-100(\d+):(\d+)$/.exec(String(place ?? ''));
+  return m ? `https://t.me/c/${m[1]}/${m[2]}` : '';
+}
+// Telegram's answers to a message aimed at a topic that is gone (deleted) — then the hub
+// unbinds the topic and says it in General. A CLOSED topic is not gone: it says TOPIC_CLOSED.
+export const isTopicGoneError = desc => /thread not found|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(String(desc ?? ''));
 
 // Quote the message that asked, so two people talking in one GROUP can tell whose answer
 // is whose. Deliberately not done in a private chat: there is only one asker, the quote

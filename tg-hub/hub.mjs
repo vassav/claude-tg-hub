@@ -25,7 +25,7 @@ import { Bot, InlineKeyboard, Keyboard, InputFile } from 'grammy';
 import { spawnSession } from './session.mjs';
 import { askOf } from './panel/ask.mjs';
 import * as access from './access.mjs';
-import { replyExtra, askChatFor, nextInbound, isGroup, placeOf, splitPlace } from './chat-target.mjs';
+import { replyExtra, askChatFor, nextInbound, isGroup, placeOf, splitPlace, isTopicPlace, topicLink, isTopicGoneError } from './chat-target.mjs';
 import { sendRich, RICH_LIMIT, chooseFileMethod, CAPTION_LIMIT } from './rich.mjs';
 import { createActive, createPending, buttonLabel, groupSessions, stripActiveMark, sessionState, stateMark, fmtDur, fmtTokens } from './routing.mjs';
 
@@ -186,8 +186,11 @@ function liveCwdConflict(id, cwd) {
 // Decide a non-live managed entry's fate. NEVER mark dead while it looks alive (own
 // process alive, or its .jsonl actively written) — that would let a resume double-write
 // one conversation. Process gone + history present → dead (resumable); nothing → discard.
+// A session WE stopped (stoppedAt) is over once its process is: a fresh .jsonl then only
+// means it was busy a moment ago, not that someone else is writing it.
+const stoppedAndGone = e => !!e?.stoppedAt && !isOwnLive(e);
 function resolveFate(e, id) {
-  if (isOwnLive(e) || jsonlFresh(id)) { e.status = 'detached'; e.lastSeen = Date.now(); }
+  if (isOwnLive(e) || (jsonlFresh(id) && !stoppedAndGone(e))) { e.status = 'detached'; e.lastSeen = Date.now(); }
   else if (conversationExists(id)) { e.status = 'dead'; e.lastSeen = Date.now(); }
   else registry.delete(id);
 }
@@ -251,9 +254,11 @@ function applyName(id, raw, fromModel) {
   if (!e && !live) return;                          // unknown session
   if (e?.named && !fromModel) return;               // slug fallback never overrides an existing name
   const label = uniqueLabel(slugLabel(raw) || folderBase(e?.cwd || live?.cwd), id);
+  const renamed = e && e.label !== label;
   if (e) { e.label = label; e.named = true; saveRegistry(); }
   if (live) live.label = label;                     // also rename non-managed (panel) live sessions
   awaitingTitle.delete(id);
+  if (renamed && e.topic && e.topicOwned) renameTopic(e.topic, label);   // its topic carries its name
 }
 // On the first request to an unnamed managed session, wait for the model's
 // set_title; if it doesn't arrive in time, fall back to slugging that request.
@@ -354,7 +359,11 @@ async function sendTg(chatId, text, sid, extra = {}, firstExtra = {}) {
     const opts = { link_preview_options: { is_disabled: true }, ...thread, ...(i === 0 ? firstExtra : {}), ...(i === parts.length - 1 ? extra : {}) };
     let sent = null;
     try { sent = await bot.api.sendMessage(chat, mdToTgHtml(parts[i]), { parse_mode: 'HTML', ...opts }); }
-    catch { try { sent = await bot.api.sendMessage(chat, parts[i], opts); } catch (e) { console.error('sendTg', e?.message); } } // plain fallback
+    catch { try { sent = await bot.api.sendMessage(chat, parts[i], opts); } catch (e) {   // plain fallback
+      // the topic was deleted: unbind it and say the whole thing in General instead
+      if (thread.message_thread_id && isTopicGoneError(e?.description || e?.message)) { topicGone(chatId); return sendTg(chat, text, sid, extra, firstExtra); }
+      console.error('sendTg', e?.message);
+    } }
     if (sent?.message_id && sid) outMsgToSession.set(sent.message_id, sid);
     if (sent) last = sent;
   }
@@ -410,7 +419,10 @@ function replyKeyboard(chatId) {
   // Bottom keyboard shows the bare label. It is the one Telegram sends back as ordinary
   // text, so its caption is also the lookup key — keeping it a plain label keeps that pair
   // trivial. The project lives on the inline /sessions list instead.
-  if (order.length) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
+  // A session's own forum topic gets no session list: a tap would make ANOTHER session
+  // active in this one's topic. (In a forum the keyboard is per topic, see topicHello.)
+  const ownTopic = [...registry.values()].some(e => e.topic && e.topic === String(chatId));
+  if (order.length && !ownTopic) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
   k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
 }
@@ -562,7 +574,8 @@ const fileMime = msg => msg.document?.mime_type || msg.audio?.mime_type || msg.v
 // Guards prevent double-spawning one conversation. Returns the session id (string)
 // on success, or null if a guard rejected (callers using `if (startSession(...))`
 // still work: a uuid string is truthy, null is falsy).
-function startSession(cwd, { resumeUuid, chatId, extraMcpServers, extraAllowedTools } = {}) {
+// `topic` ({ place, owned }) binds the session to a forum topic for good (see startFromChat).
+function startSession(cwd, { resumeUuid, chatId, topic, extraMcpServers, extraAllowedTools } = {}) {
   const id = resumeUuid || randomUUID();
   const e0 = registry.get(id);
   if (!inProjects(cwd)) { notify(`⛔ ${cwd} is outside this bot's projects (HUB_PROJECTS)`); return null; }
@@ -570,7 +583,7 @@ function startSession(cwd, { resumeUuid, chatId, extraMcpServers, extraAllowedTo
   if (isOwnLive(e0)) { notify(`${labelOf(id)} is still alive — not resuming (it should reconnect on its own)`); return null; }
   if (resumeUuid) {
     if (!conversationExists(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — its history is gone`); registry.delete(id); saveRegistry(); return null; }
-    if (jsonlFresh(resumeUuid)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return null; }
+    if (jsonlFresh(resumeUuid) && !stoppedAndGone(e0)) { notify(`can't resume ${id.slice(0, 8)} — that conversation looks active right now`); return null; }
     if (liveCwdConflict(id, cwd)) { notify(`can't resume ${id.slice(0, 8)} — another live session is in ${cwd}`); return null; }
   }
   pendingActivate.set(id, String(chatId || CHAT));   // activate it only in the chat that asked
@@ -580,7 +593,8 @@ function startSession(cwd, { resumeUuid, chatId, extraMcpServers, extraAllowedTo
   } catch (e) { pendingActivate.delete(id); registry.delete(id); saveRegistry(); notify(`start failed: ${e?.message}`); return null; }
   // Record the REAL claude pid now (from the pty child), independent of the shim
   // registering — so the liveness guard holds during the spawn→register window.
-  upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: child?.pid ?? null, bootId: BOOT_ID, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now() });
+  upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: child?.pid ?? null, bootId: BOOT_ID, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now(), stoppedAt: null,
+    ...(topic ? { topic: topic.place, topicOwned: !!topic.owned } : {}) });
   // Watchdog: if it never registers, resolve its fate by liveness (alive → keep; gone → dead/discard).
   setTimeout(() => {
     if (!pendingActivate.has(id) || sessions.has(id)) return;
@@ -713,8 +727,43 @@ function projectsKeyboard() {
 }
 const projectsPrompt = () => lastProjects.length ? PROJECTS_PROMPT : '📁 Проектов с сессиями пока нет — создай новый:';
 
-// /new <arg> and ➕ Новый проект: resolve the name/path (access.projectPath), create the
-// folder if it's missing and allowed, then start a session there, active in this chat.
+// /new: a session in an EXISTING project. It never makes a folder — a typo would quietly
+// become a new project; a missing one gets a 📁 button that creates it on purpose.
+const missingProj = new Map();   // place -> the name /new didn't find, for the 📁 button
+const openPick = new Map();      // place -> [cwd] when that name exists under several roots
+async function openProject(ctx, arg) {
+  const r = access.projectPath(arg, PROJECT_ROOTS);
+  if (r.error) { await ctx.reply(`⚠️ ${r.error}`); return; }
+  const found = r.pickRoot
+    ? PROJECT_ROOTS.map(root => access.projectPath(arg, [root]).cwd).filter(c => c && existsSync(c))
+    : (existsSync(r.cwd) ? [r.cwd] : []);
+  if (found.length > 1) {
+    openPick.set(here(ctx), found);
+    const kb = new InlineKeyboard();
+    found.forEach((c, i) => kb.text(c, `npo:${i}`).row());
+    await ctx.reply(`«${arg.trim()}» есть в нескольких папках — в каком?`, { reply_markup: kb });
+    return;
+  }
+  if (!found.length) {
+    if (!r.pickRoot && !r.canCreate) { await ctx.reply(`⚠️ папки нет: ${r.cwd}`); return; }   // outside the roots, or no roots at all
+    missingProj.set(here(ctx), arg);
+    const name = arg.trim();
+    await ctx.reply(`⚠️ проекта «${name}» нет. /new открывает только существующие проекты.`,
+      { reply_markup: new InlineKeyboard().text(`📁 Создать проект «${name.slice(0, 40)}»`, 'mkproj') });
+    return;
+  }
+  if (await startFromChat(ctx, found[0])) await ctx.reply(`➕ starting new session in ${found[0]}…`);
+}
+// ➕ Новый проект and a bare /newproject: ask for the name; the reply goes to newProject().
+async function askProjectName(ctx) {
+  const hint = PROJECT_ROOTS.length ? `папка в ${PROJECT_ROOTS.join(' или ')}` : 'полный путь к существующей папке';
+  const sent = await ctx.reply(`Название нового проекта (${hint}) — ответом на это сообщение:`,
+    { reply_markup: { force_reply: true, input_field_placeholder: PROJECT_ROOTS.length ? 'Oligo' : 'D:/path/to/project' } }).catch(() => null);
+  if (sent?.message_id) newProjPrompt.set(sent.message_id, here(ctx));
+}
+
+// /newproject <arg> and ➕ Новый проект: resolve the name/path (access.projectPath), create
+// the folder if it's missing and allowed, then start a session there, active in this chat.
 // `root` is set when the user picked one of several HUB_PROJECTS roots.
 async function newProject(ctx, arg, root) {
   const r = access.projectPath(arg, root ? [root] : PROJECT_ROOTS);
@@ -732,7 +781,91 @@ async function newProject(ctx, arg, root) {
     catch (e) { await ctx.reply(`⚠️ не смог создать ${r.cwd}: ${e?.message || e}`); return; }
     await ctx.reply(`📁 создан проект ${r.cwd}`);
   }
-  if (startSession(r.cwd, { chatId: here(ctx) })) await ctx.reply(`➕ starting new session in ${r.cwd}…`);
+  if (await startFromChat(ctx, r.cwd)) await ctx.reply(`➕ starting new session in ${r.cwd}…`);
+}
+
+// ── forum: a topic per session ───────────────────────────────────────────────
+// A session started or resumed from a forum's General gets a topic of its own, named after
+// it; started inside a topic, it lives in that topic. Either way the binding goes into the
+// registry (topic, topicOwned), so after /stop or a hub restart the session comes back to
+// the same topic. Only topics the hub created itself are renamed after the session and
+// closed with it — a topic a person made stays theirs.
+const topicApi = (place, call) => { const { chat, thread } = splitPlace(place); return call(chat, thread.message_thread_id).catch(e => e); };
+const renameTopic = (place, name) => topicApi(place, (c, t) => bot.api.editForumTopic(c, t, { name: String(name).slice(0, 128) }));
+const closeTopic = place => topicApi(place, (c, t) => bot.api.closeForumTopic(c, t));
+// Where a session started from this update should live: { place, topic?, created? }, or
+// { error } when its topic couldn't be reopened.
+async function topicFor(ctx, id, label) {
+  const e = id && registry.get(id);
+  if (e?.topic) {                                   // it has a topic — reopen it (no-op if open) and go back there
+    const r = await topicApi(e.topic, (c, t) => bot.api.reopenForumTopic(c, t));
+    const desc = r instanceof Error ? (r.description || r.message || '') : '';
+    if (!desc || /TOPIC_NOT_MODIFIED/i.test(desc)) return { place: e.topic, topic: { place: e.topic, owned: !!e.topicOwned } };
+    // Only a topic Telegram says is gone may be replaced: a network blip or a revoked right
+    // must not cost the session its topic (a new one would overwrite the binding).
+    if (!isTopicGoneError(desc)) return { error: `не смог открыть тему сессии (${desc})` };
+  }
+  if (ctx.msg?.is_topic_message) return { place: here(ctx), topic: { place: here(ctx), owned: false } };
+  if (!ctx.chat?.is_forum) return { place: here(ctx) };
+  try {
+    const t = await bot.api.createForumTopic(ctx.chat.id, String(label).slice(0, 128));
+    const place = `${ctx.chat.id}:${t.message_thread_id}`;
+    return { place, topic: { place, owned: true }, created: true };
+  } catch (err) {
+    await ctx.reply(`⚠️ не смог создать тему (${err?.description || err?.message}) — боту нужно право «Управление темами». Сессия будет здесь.`);
+    return { place: here(ctx) };
+  }
+}
+// The one way a person starts or resumes a session from Telegram (/new, ➕, /projects, ▶).
+async function startFromChat(ctx, cwd, opts = {}) {
+  const id = opts.resumeUuid;
+  const label = (id && (registry.get(id)?.label || diskTitle(id))) || makeLabel(cwd);
+  const hadTopic = !!(id && registry.get(id)?.topic);
+  const t = await topicFor(ctx, id, label);
+  if (t.error) { await ctx.reply(`⚠️ ${t.error} — попробуй ещё раз`); return null; }
+  const sid = startSession(cwd, { ...opts, chatId: t.place, topic: t.topic });
+  if (!sid) { if (t.created) await topicApi(t.place, (c, th) => bot.api.deleteForumTopic(c, th)); return null; }   // no empty topics
+  // Text held here (written before this chat had a session) is delivered where the session
+  // becomes active — its topic — so it has to move there with it.
+  if (t.place !== here(ctx)) { const held = pending.take(here(ctx)); if (held) pending.put(t.place, held); }
+  if (t.topic && t.place !== here(ctx)) await ctx.reply(`📌 ${label} — в теме ${topicLink(t.place) || ''}`.trim(), { link_preview_options: { is_disabled: true } }).catch(() => {});
+  // In a forum the bottom keyboard belongs to a topic: one the hub made (or one the session
+  // just moved into) has none until something brings it — so the first message does.
+  if (t.topic && (t.created || !hadTopic || t.place !== here(ctx)))
+    await sendTg(t.place, `▶ ${label}\n📁 ${cwd}\nПиши сюда — это тема этой сессии.`, null, { reply_markup: replyKeyboard(t.place) });
+  return sid;
+}
+// /stop, ⏹ and a topic closed by hand. A session with a topic stays in the registry (⏸,
+// resumable into the same topic); one without is forgotten, as before.
+async function stopSession(id, { topicClosedByUser = false } = {}) {
+  sendToSession(id, { t: 'stop' });
+  clearWorking(id);
+  const e = registry.get(id);
+  if (!e?.topic) { registry.delete(id); saveRegistry(); return; }
+  e.stoppedAt = Date.now(); saveRegistry();   // resumable as soon as its process is gone (see stoppedAndGone)
+  if (e.topicOwned && !topicClosedByUser) {
+    await sendTg(e.topic, `🛑 ${labelOf(id)} остановлена. Вернуть: /sessions → ⏸ (тема откроется сама).`);
+    await closeTopic(e.topic);
+  }
+}
+// The stopped session bound to a topic, if any (a live one is simply the topic's active one).
+const boundTo = place => isTopicPlace(place) && [...registry.values()]
+  .find(e => e.topic === place && e.managed && e.status === 'dead' && !sessions.has(e.id) && !pendingActivate.has(e.id));
+
+// A topic closed by hand in Telegram stops its session, like /stop (the topic stays closed).
+bot.on('message:forum_topic_closed', async ctx => {
+  if (!owns(ctx)) return;
+  const place = here(ctx);
+  const id = active.get(place) || [...registry.values()].find(e => e.topic === place && sessions.has(e.id))?.id;
+  if (id && sessions.has(id)) await stopSession(id, { topicClosedByUser: true });
+});
+
+// A deleted topic: unbind it, so the session isn't aimed at nothing, and say so.
+function topicGone(place) {
+  active.drop(place);
+  let hit = false;
+  for (const e of registry.values()) if (e.topic === place) { delete e.topic; delete e.topicOwned; hit = true; notify(`⚠️ тема сессии ${e.label} удалена — сессия осталась без темы, выбери её через /sessions`); }
+  if (hit) saveRegistry();
 }
 
 // ── startup recovery ─────────────────────────────────────────────────────────
@@ -798,6 +931,7 @@ net.createServer(sock => {
         if (!known?.named) { const dt = diskTitle(sid); if (dt) applyName(sid, dt, true); }
         const wantChat = pendingActivate.get(sid);
         if (wantChat !== undefined) { active.set(wantChat, sid); pendingActivate.delete(sid); }
+        else if (known?.topic) active.set(known.topic, sid);  // came back on its own (hub restart) → its topic again
         else if (!active.get(CHAT)) active.set(CHAT, sid);   // first session ever → home chat
         // The picker offered in an empty chat also lists ⏸ resumable sessions, and tapping one
         // goes through startSession — never through the switch: handler. Deliver here, where a
@@ -1056,16 +1190,21 @@ bot.command('stop', async ctx => {
   const arg = (ctx.match || '').trim();
   const id = order.find(x => labelOf(x) === arg || x === arg);
   if (!id) { await ctx.reply('not found — /sessions to list'); return; }
-  sendToSession(id, { t: 'stop' });
-  clearWorking(id);
-  registry.delete(id); saveRegistry(); // explicit stop → don't offer as resumable
   await ctx.reply(`🛑 stopping ${labelOf(id)}…`);
+  await stopSession(id);   // without a topic: forgotten (not offered as resumable); with one: ⏸ + topic closed
 });
 
 bot.command('new', async ctx => {
   if (!owns(ctx)) return;
   const arg = (ctx.match || '').trim();
-  if (!arg) { await ctx.reply(`usage: /new <имя проекта | полный путь>\n${PROJECT_ROOTS.length ? `имя — папка в ${PROJECT_ROOTS.join(' или ')}, создаётся, если её нет` : 'у этого бота нет HUB_PROJECTS — только полный путь к существующей папке'}\n(или /projects → ➕)`); return; }
+  if (!arg) { await ctx.reply(`usage: /new <имя проекта | полный путь> — новая сессия в существующем проекте${PROJECT_ROOTS.length ? ` (папка в ${PROJECT_ROOTS.join(' или ')})` : ''}\nновый проект: /newproject <имя> или /projects → ➕ Новый проект`); return; }
+  await openProject(ctx, arg);
+});
+
+bot.command('newproject', async ctx => {
+  if (!owns(ctx)) return;
+  const arg = (ctx.match || '').trim();
+  if (!arg) { await askProjectName(ctx); return; }
   await newProject(ctx, arg);
 });
 
@@ -1122,7 +1261,7 @@ bot.on('callback_query:data', async ctx => {
 
   if ((m = /^stop:(.+)$/.exec(data))) {
     const id = m[1];
-    if (sessions.has(id)) { sendToSession(id, { t: 'stop' }); clearWorking(id); registry.delete(id); saveRegistry(); await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); }
+    if (sessions.has(id)) { await ctx.answerCallbackQuery({ text: `stopping ${labelOf(id)}` }).catch(() => {}); await stopSession(id); }
     else await ctx.answerCallbackQuery({ text: 'already gone' }).catch(() => {});
     return;
   }
@@ -1245,7 +1384,7 @@ bot.on('callback_query:data', async ctx => {
     if (!cwd) { await ctx.answerCallbackQuery({ text: 'no cwd' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(cwd, { resumeUuid: id, chatId: here(ctx) }); // startSession enforces liveness/history guards
+    await startFromChat(ctx, cwd, { resumeUuid: id }); // startSession enforces liveness/history guards
     return;
   }
 
@@ -1255,7 +1394,7 @@ bot.on('callback_query:data', async ctx => {
     if (!e?.cwd) { await ctx.answerCallbackQuery({ text: 'unknown session' }).catch(() => {}); return; }
     if (sessions.has(id) || pendingActivate.has(id)) { await ctx.answerCallbackQuery({ text: 'already running' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'resuming…' }).catch(() => {});
-    startSession(e.cwd, { resumeUuid: id, chatId: here(ctx) });
+    await startFromChat(ctx, e.cwd, { resumeUuid: id });
     return;
   }
 
@@ -1263,7 +1402,7 @@ bot.on('callback_query:data', async ctx => {
     const p = lastProjects[Number(m[1])];
     if (!p?.cwd) { await ctx.answerCallbackQuery({ text: 'open /projects again' }).catch(() => {}); return; }
     await ctx.answerCallbackQuery({ text: 'starting…' }).catch(() => {});
-    startSession(p.cwd, { chatId: here(ctx) });
+    await startFromChat(ctx, p.cwd);
     return;
   }
 
@@ -1281,10 +1420,29 @@ bot.on('callback_query:data', async ctx => {
   // ➕ Новый проект → ask for the name; the reply to this prompt goes to newProject().
   if (data === 'newproj') {
     await ctx.answerCallbackQuery().catch(() => {});
-    const hint = PROJECT_ROOTS.length ? `папка в ${PROJECT_ROOTS.join(' или ')}` : 'полный путь к существующей папке';
-    const sent = await ctx.reply(`Название нового проекта (${hint}) — ответом на это сообщение:`,
-      { reply_markup: { force_reply: true, input_field_placeholder: PROJECT_ROOTS.length ? 'Oligo' : 'D:/path/to/project' } }).catch(() => null);
-    if (sent?.message_id) newProjPrompt.set(sent.message_id, here(ctx));
+    await askProjectName(ctx);
+    return;
+  }
+
+  // 📁 under "/new: no such project" → create it, on purpose this time
+  if (data === 'mkproj') {
+    const arg = missingProj.get(here(ctx));
+    if (!arg) { await ctx.answerCallbackQuery({ text: 'устарело — /newproject <имя>' }).catch(() => {}); return; }
+    missingProj.delete(here(ctx));
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup().catch(() => {});
+    await newProject(ctx, arg);
+    return;
+  }
+
+  // /new found the name under several roots → the one picked
+  if ((m = /^npo:(\d+)$/.exec(data))) {
+    const cwd = openPick.get(here(ctx))?.[Number(m[1])];
+    if (!cwd) { await ctx.answerCallbackQuery({ text: 'устарело — /new ещё раз' }).catch(() => {}); return; }
+    openPick.delete(here(ctx));
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup().catch(() => {});
+    if (await startFromChat(ctx, cwd)) await ctx.reply(`➕ starting new session in ${cwd}…`);
     return;
   }
 
@@ -1343,6 +1501,14 @@ bot.on('message:text', async ctx => {
   }
 
   const cur = activeIn(ctx);
+  // A topic whose session is stopped: bring it back and hand it this message (delivered on register).
+  const bound = !cur && boundTo(here(ctx));
+  if (bound) {
+    pending.put(here(ctx), quoted + text);
+    await ctx.reply(`▶ поднимаю ${bound.label}…`);
+    if (!await startFromChat(ctx, bound.cwd, { resumeUuid: bound.id })) pending.take(here(ctx));
+    return;
+  }
   if (!cur) {
     // Don't drop what they wrote: hold it and let them pick a session — the tap delivers it.
     if (!order.length) { await ctx.reply('нет живых сессий — /projects, чтобы поднять'); return; }
