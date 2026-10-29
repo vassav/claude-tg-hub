@@ -214,6 +214,34 @@ function loadRegistry() {
   catch { try { renameSync(REG_FILE, REG_FILE + '.corrupt-' + Date.now()); } catch {} console.error('[hub] registry corrupt — backed up, starting empty'); return false; }
 }
 function upsertRegistry(id, patch) { registry.set(id, { ...(registry.get(id) || { id }), ...patch, id }); saveRegistry(); }
+
+// ── session ↔ forum topic ────────────────────────────────────────────────────
+// Kept apart from the registry on purpose: a session forgotten there (🗑, TTL, a manual
+// cleanup) still comes back to its own topic — from /projects, or by writing into it.
+// Only a topic Telegram says is gone drops a binding. owned = the hub created that topic
+// (only those are renamed after the session and closed with it).
+const TOPICS_FILE = join(HUB_CFG_DIR, 'topics.json');
+const topics = new Map();   // sessionId -> { place, owned }
+function saveTopics() {
+  try {
+    mkdirSync(HUB_CFG_DIR, { recursive: true });
+    const tmp = TOPICS_FILE + '.tmp', fd = openSync(tmp, 'w');
+    try { writeSync(fd, JSON.stringify(Object.fromEntries(topics), null, 2)); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, TOPICS_FILE);
+  } catch (e) { console.error('[hub] topics save failed:', e?.message); }
+}
+function loadTopics() {
+  let raw;
+  try { raw = readFileSync(TOPICS_FILE, 'utf8'); } catch { return; }
+  try { for (const [id, t] of Object.entries(JSON.parse(raw))) if (t?.place) topics.set(id, { place: String(t.place), owned: !!t.owned }); }
+  catch { try { renameSync(TOPICS_FILE, TOPICS_FILE + '.corrupt-' + Date.now()); } catch {} console.error('[hub] topics.json corrupt — backed up, starting empty'); }
+}
+const topicOf = id => (id && topics.get(id)) || null;
+const sessionInTopic = place => [...topics].find(([, t]) => t.place === String(place))?.[0] || null;
+function bindTopic(id, place, owned) {
+  for (const [sid, t] of topics) if (sid !== id && t.place === place) topics.delete(sid);   // one session per topic
+  topics.set(id, { place, owned: !!owned }); saveTopics();
+}
 // Resumable = managed, confirmed dead (process gone), and we're not already running it.
 function resumableEntries() { return [...registry.values()].filter(e => e.managed && e.status === 'dead' && !sessions.has(e.id)); }
 
@@ -258,7 +286,8 @@ function applyName(id, raw, fromModel) {
   if (e) { e.label = label; e.named = true; saveRegistry(); }
   if (live) live.label = label;                     // also rename non-managed (panel) live sessions
   awaitingTitle.delete(id);
-  if (renamed && e.topic && e.topicOwned) renameTopic(e.topic, label);   // its topic carries its name
+  const t = topicOf(id);
+  if (renamed && t?.owned) renameTopic(t.place, label);   // its topic carries its name
 }
 // On the first request to an unnamed managed session, wait for the model's
 // set_title; if it doesn't arrive in time, fall back to slugging that request.
@@ -421,7 +450,7 @@ function replyKeyboard(chatId) {
   // trivial. The project lives on the inline /sessions list instead.
   // A session's own forum topic gets no session list: a tap would make ANOTHER session
   // active in this one's topic. (In a forum the keyboard is per topic, see topicHello.)
-  const ownTopic = [...registry.values()].some(e => e.topic && e.topic === String(chatId));
+  const ownTopic = !!sessionInTopic(chatId);
   if (order.length && !ownTopic) { for (const id of order) k.text(labelOf(id) + (id === cur ? ' ✓' : '')); k.row(); }
   k.text('/sessions').text('/projects').text('⚙ пульт');
   return k.resized();
@@ -594,7 +623,8 @@ function startSession(cwd, { resumeUuid, chatId, topic, extraMcpServers, extraAl
   // Record the REAL claude pid now (from the pty child), independent of the shim
   // registering — so the liveness guard holds during the spawn→register window.
   upsertRegistry(id, { cwd, label: e0?.label || makeLabel(cwd), status: 'starting', managed: true, resumeUuid: id, pid: child?.pid ?? null, bootId: BOOT_ID, createdAt: e0?.createdAt || Date.now(), lastSeen: Date.now(), stoppedAt: null,
-    ...(topic ? { topic: topic.place, topicOwned: !!topic.owned } : {}) });
+  });
+  if (topic) bindTopic(id, topic.place, topic.owned);
   // Watchdog: if it never registers, resolve its fate by liveness (alive → keep; gone → dead/discard).
   setTimeout(() => {
     if (!pendingActivate.has(id) || sessions.has(id)) return;
@@ -787,7 +817,7 @@ async function newProject(ctx, arg, root) {
 // ── forum: a topic per session ───────────────────────────────────────────────
 // A session started or resumed from a forum's General gets a topic of its own, named after
 // it; started inside a topic, it lives in that topic. Either way the binding goes into the
-// registry (topic, topicOwned), so after /stop or a hub restart the session comes back to
+// topics store (topics.json), so after /stop, 🗑 or a hub restart the session comes back to
 // the same topic. Only topics the hub created itself are renamed after the session and
 // closed with it — a topic a person made stays theirs.
 const topicApi = (place, call) => { const { chat, thread } = splitPlace(place); return call(chat, thread.message_thread_id).catch(e => e); };
@@ -796,11 +826,11 @@ const closeTopic = place => topicApi(place, (c, t) => bot.api.closeForumTopic(c,
 // Where a session started from this update should live: { place, topic?, created? }, or
 // { error } when its topic couldn't be reopened.
 async function topicFor(ctx, id, label) {
-  const e = id && registry.get(id);
-  if (e?.topic) {                                   // it has a topic — reopen it (no-op if open) and go back there
-    const r = await topicApi(e.topic, (c, t) => bot.api.reopenForumTopic(c, t));
+  const b = topicOf(id);
+  if (b) {                                          // it has a topic — reopen it (no-op if open) and go back there
+    const r = await topicApi(b.place, (c, t) => bot.api.reopenForumTopic(c, t));
     const desc = r instanceof Error ? (r.description || r.message || '') : '';
-    if (!desc || /TOPIC_NOT_MODIFIED/i.test(desc)) return { place: e.topic, topic: { place: e.topic, owned: !!e.topicOwned } };
+    if (!desc || /TOPIC_NOT_MODIFIED/i.test(desc)) return { place: b.place, topic: b };
     // Only a topic Telegram says is gone may be replaced: a network blip or a revoked right
     // must not cost the session its topic (a new one would overwrite the binding).
     if (!isTopicGoneError(desc)) return { error: `не смог открыть тему сессии (${desc})` };
@@ -820,7 +850,7 @@ async function topicFor(ctx, id, label) {
 async function startFromChat(ctx, cwd, opts = {}) {
   const id = opts.resumeUuid;
   const label = (id && (registry.get(id)?.label || diskTitle(id))) || makeLabel(cwd);
-  const hadTopic = !!(id && registry.get(id)?.topic);
+  const hadTopic = !!topicOf(id);
   const t = await topicFor(ctx, id, label);
   if (t.error) { await ctx.reply(`⚠️ ${t.error} — попробуй ещё раз`); return null; }
   const sid = startSession(cwd, { ...opts, chatId: t.place, topic: t.topic });
@@ -841,22 +871,32 @@ async function stopSession(id, { topicClosedByUser = false } = {}) {
   sendToSession(id, { t: 'stop' });
   clearWorking(id);
   const e = registry.get(id);
-  if (!e?.topic) { registry.delete(id); saveRegistry(); return; }
-  e.stoppedAt = Date.now(); saveRegistry();   // resumable as soon as its process is gone (see stoppedAndGone)
-  if (e.topicOwned && !topicClosedByUser) {
-    await sendTg(e.topic, `🛑 ${labelOf(id)} остановлена. Вернуть: /sessions → ⏸ (тема откроется сама).`);
-    await closeTopic(e.topic);
+  const b = topicOf(id);
+  if (!b) { registry.delete(id); saveRegistry(); return; }
+  if (e) { e.stoppedAt = Date.now(); saveRegistry(); }   // resumable as soon as its process is gone (see stoppedAndGone)
+  if (b.owned && !topicClosedByUser) {
+    await sendTg(b.place, `🛑 ${labelOf(id)} остановлена. Вернуть: /sessions → ⏸ или просто напиши сюда.`);
+    await closeTopic(b.place);
   }
 }
 // The stopped session bound to a topic, if any (a live one is simply the topic's active one).
-const boundTo = place => isTopicPlace(place) && [...registry.values()]
-  .find(e => e.topic === place && e.managed && e.status === 'dead' && !sessions.has(e.id) && !pendingActivate.has(e.id));
+// It may be gone from the registry (🗑, TTL) — then cwd and name come from its transcript.
+function boundTo(place) {
+  const id = isTopicPlace(place) && sessionInTopic(place);
+  if (!id || sessions.has(id) || pendingActivate.has(id)) return null;
+  const e = registry.get(id);
+  if (e && e.status !== 'dead') return null;        // detached/starting: it may still come back by itself
+  const f = conversationFile(id);
+  const cwd = e?.cwd || (f && readMeta(f).cwd);
+  if (!cwd) return null;
+  return { id, cwd, label: e?.label || diskTitle(id) || id.slice(0, 8) };
+}
 
 // A topic closed by hand in Telegram stops its session, like /stop (the topic stays closed).
 bot.on('message:forum_topic_closed', async ctx => {
   if (!owns(ctx)) return;
   const place = here(ctx);
-  const id = active.get(place) || [...registry.values()].find(e => e.topic === place && sessions.has(e.id))?.id;
+  const id = active.get(place) || sessionInTopic(place);
   if (id && sessions.has(id)) await stopSession(id, { topicClosedByUser: true });
 });
 
@@ -864,8 +904,8 @@ bot.on('message:forum_topic_closed', async ctx => {
 function topicGone(place) {
   active.drop(place);
   let hit = false;
-  for (const e of registry.values()) if (e.topic === place) { delete e.topic; delete e.topicOwned; hit = true; notify(`⚠️ тема сессии ${e.label} удалена — сессия осталась без темы, выбери её через /sessions`); }
-  if (hit) saveRegistry();
+  for (const [id, t] of topics) if (t.place === place) { topics.delete(id); hit = true; notify(`⚠️ тема сессии ${labelOf(id)} удалена — сессия осталась без темы, выбери её через /sessions`); }
+  if (hit) saveTopics();
 }
 
 // ── startup recovery ─────────────────────────────────────────────────────────
@@ -877,6 +917,15 @@ if (loadRegistry()) {
   saveRegistry();
 } else {
   notify('⚠️ registry.json was unreadable — backed up, started empty. Use /projects to resume past sessions.');
+}
+loadTopics();
+{ // a registry from before topics.json carried the bindings itself — move them over, once
+  let moved = false;
+  for (const e of registry.values()) if ('topic' in e || 'topicOwned' in e) {
+    if (e.topic && !topics.has(e.id)) topics.set(e.id, { place: String(e.topic), owned: !!e.topicOwned });
+    delete e.topic; delete e.topicOwned; moved = true;
+  }
+  if (moved) { saveTopics(); saveRegistry(); }
 }
 setInterval(janitor, JANITOR_MS);
 setTimeout(() => {
@@ -931,7 +980,7 @@ net.createServer(sock => {
         if (!known?.named) { const dt = diskTitle(sid); if (dt) applyName(sid, dt, true); }
         const wantChat = pendingActivate.get(sid);
         if (wantChat !== undefined) { active.set(wantChat, sid); pendingActivate.delete(sid); }
-        else if (known?.topic) active.set(known.topic, sid);  // came back on its own (hub restart) → its topic again
+        else if (topicOf(sid)) active.set(topicOf(sid).place, sid);  // came back on its own (hub restart) → its topic again
         else if (!active.get(CHAT)) active.set(CHAT, sid);   // first session ever → home chat
         // The picker offered in an empty chat also lists ⏸ resumable sessions, and tapping one
         // goes through startSession — never through the switch: handler. Deliver here, where a
@@ -1506,7 +1555,10 @@ bot.on('message:text', async ctx => {
   if (bound) {
     pending.put(here(ctx), quoted + text);
     await ctx.reply(`▶ поднимаю ${bound.label}…`);
-    if (!await startFromChat(ctx, bound.cwd, { resumeUuid: bound.id })) pending.take(here(ctx));
+    if (!await startFromChat(ctx, bound.cwd, { resumeUuid: bound.id })) {
+      pending.take(here(ctx));
+      await ctx.reply(`⚠️ ${bound.label} не поднялась — причина в личке у владельца. Если её только что остановили, попробуй через минуту.`);
+    }
     return;
   }
   if (!cur) {
